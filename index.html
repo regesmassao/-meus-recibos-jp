@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1b2a4a">
+<title>Meus Recibos JP</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🧾 Meus Recibos JP</div>
+  <button id="btnBackup" class="ghost" type="button">Backup</button>
+</header>
+
+<main>
+  <!-- INÍCIO -->
+  <section id="view-home" class="view">
+    <div class="monthnav">
+      <button id="monthPrev" type="button" aria-label="Mês anterior">◀</button>
+      <div id="monthLabel" class="monthlabel">—</div>
+      <button id="monthNext" type="button" aria-label="Próximo mês">▶</button>
+    </div>
+
+    <div class="card total-card">
+      <div class="total-label">Gastos (recibos) no mês</div>
+      <div id="monthTotal" class="total-value">¥0</div>
+      <div id="monthCount" class="muted"></div>
+    </div>
+
+    <div class="card">
+      <h2>Para onde foi o dinheiro</h2>
+      <div id="catBars"></div>
+    </div>
+
+    <div class="card">
+      <h2>Contas a vencer</h2>
+      <div id="dueList"></div>
+    </div>
+
+    <div class="card">
+      <h2>Promoções ainda válidas</h2>
+      <div id="promoList"></div>
+    </div>
+  </section>
+
+  <!-- ADICIONAR -->
+  <section id="view-add" class="view hidden">
+    <div class="card">
+      <h2>Adicionar papel</h2>
+      <p class="muted">Tire foto de um recibo, conta ou promoção. O app lê, organiza e você confere antes de salvar.</p>
+      <div class="stack">
+        <button id="btnCamera" class="primary big" type="button">📷 Tirar foto</button>
+        <button id="btnGallery" class="big" type="button">🖼️ Escolher da galeria</button>
+        <button id="btnQR" class="big" type="button">🔳 Ler QR Code</button>
+        <button id="btnManual" class="big" type="button">✍️ Adicionar sem foto</button>
+      </div>
+      <div id="ocrBox" class="hidden">
+        <div class="muted" id="ocrStatus">Lendo a foto…</div>
+        <div class="progress"><div id="ocrBar"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- REVISÃO / EDIÇÃO -->
+  <section id="view-review" class="view hidden">
+    <div class="card">
+      <h2 id="reviewTitle">Confira antes de salvar</h2>
+      <img id="fPhoto" class="photo-preview hidden" alt="Foto do papel">
+      <div class="field">
+        <label>Tipo</label>
+        <div class="seg" id="fType">
+          <button type="button" data-type="recibo">🧾 Recibo</button>
+          <button type="button" data-type="conta">📄 Conta</button>
+          <button type="button" data-type="promocao">🏷️ Promoção</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="fStore">Loja / título</label>
+        <input id="fStore" type="text" placeholder="Ex.: Gyomu Super, conta de luz…">
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label for="fDate">Data</label>
+          <input id="fDate" type="date">
+        </div>
+        <div class="field">
+          <label for="fAmount">Valor (¥)</label>
+          <input id="fAmount" type="number" inputmode="numeric" min="0" step="1" placeholder="0">
+        </div>
+      </div>
+      <div class="field" id="wrapCategory">
+        <label for="fCategory">Categoria</label>
+        <select id="fCategory"></select>
+      </div>
+      <div class="field hidden" id="wrapDue">
+        <label for="fDue">Vencimento</label>
+        <input id="fDue" type="date">
+      </div>
+      <div class="field hidden" id="wrapValid">
+        <label for="fValid">Válida até</label>
+        <input id="fValid" type="date">
+      </div>
+      <div class="field">
+        <label for="fNote">Observações</label>
+        <textarea id="fNote" rows="2" placeholder="Opcional"></textarea>
+      </div>
+      <div id="fLinkBox" class="field hidden">
+        <label>Link do QR Code</label>
+        <div><a id="fLink" href="#" target="_blank" rel="noopener"></a></div>
+      </div>
+      <div class="row gap">
+        <button id="btnCancelReview" class="big" type="button">Cancelar</button>
+        <button id="btnSave" class="primary big grow" type="button">Salvar</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- HISTÓRICO -->
+  <section id="view-history" class="view hidden">
+    <div class="card">
+      <h2>Histórico</h2>
+      <div class="seg" id="filterType">
+        <button type="button" data-type="todos" class="on">Todos</button>
+        <button type="button" data-type="recibo">🧾 Recibos</button>
+        <button type="button" data-type="conta">📄 Contas</button>
+        <button type="button" data-type="promocao">🏷️ Promoções</button>
+      </div>
+      <div class="grid2 mt">
+        <select id="filterCategory"></select>
+        <input id="filterSearch" type="search" placeholder="Buscar por loja/título…">
+      </div>
+    </div>
+    <div id="historyList"></div>
+  </section>
+
+  <!-- DETALHE -->
+  <section id="view-detail" class="view hidden">
+    <div class="card">
+      <button id="btnBackDetail" class="ghost" type="button">← Voltar</button>
+      <h2 id="dTitle">—</h2>
+      <img id="dPhoto" class="photo-preview hidden" alt="Foto do papel">
+      <dl id="dFields" class="detail-fields"></dl>
+      <div class="stack mt">
+        <button id="btnTogglePaid" class="big hidden" type="button">Marcar como paga</button>
+        <button id="btnEdit" class="primary big" type="button">Editar</button>
+        <button id="btnDelete" class="danger big" type="button">Excluir</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- BACKUP -->
+  <section id="view-backup" class="view hidden">
+    <div class="card">
+      <h2>Backup</h2>
+      <p class="muted">Tudo fica salvo só neste aparelho. Exporte de vez em quando para não perder seus dados.</p>
+      <div class="stack">
+        <button id="btnExport" class="primary big" type="button">⬇️ Exportar backup (JSON)</button>
+        <button id="btnImport" class="big" type="button">⬆️ Importar backup (JSON)</button>
+      </div>
+      <p class="muted" id="backupInfo"></p>
+    </div>
+  </section>
+</main>
+
+<nav class="tabbar">
+  <button id="tabHome" type="button" class="on">🏠<span>Início</span></button>
+  <button id="tabAdd" type="button" class="add">＋<span>Adicionar</span></button>
+  <button id="tabHistory" type="button">🗂️<span>Histórico</span></button>
+</nav>
+
+<!-- QR overlay -->
+<div id="qrOverlay" class="overlay hidden">
+  <div class="overlay-box">
+    <div class="row between">
+      <strong>Ler QR Code</strong>
+      <button id="btnCloseQR" class="ghost" type="button">✕ Fechar</button>
+    </div>
+    <video id="qrVideo" playsinline muted></video>
+    <canvas id="qrCanvas" class="hidden"></canvas>
+    <p class="muted" id="qrStatus">Aponte a câmera para o QR Code…</p>
+  </div>
+</div>
+
+<input id="fileCamera" type="file" accept="image/*" capture="environment" class="hidden">
+<input id="fileGallery" type="file" accept="image/*" class="hidden">
+<input id="fileImport" type="file" accept="application/json,.json" class="hidden">
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

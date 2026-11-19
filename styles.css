@@ -1,0 +1,110 @@
+:root{
+  --navy:#1b2a4a; --navy2:#24365e; --cream:#f7f3ea; --paper:#fffdf7;
+  --ink:#1c2333; --muted:#6b7280; --line:#e3ddcf; --accent:#c9a227;
+  --red:#c0392b; --green:#1e7d4f; --radius:14px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Sans","Noto Sans JP",sans-serif;
+  background:var(--cream); color:var(--ink);
+  padding-bottom:84px;
+}
+.topbar{
+  position:sticky; top:0; z-index:20;
+  display:flex; justify-content:space-between; align-items:center;
+  background:var(--navy); color:var(--cream);
+  padding:calc(10px + env(safe-area-inset-top)) 16px 10px;
+}
+.brand{font-weight:700; font-size:17px}
+main{max-width:640px; margin:0 auto; padding:14px 12px}
+.view.hidden,.hidden{display:none !important}
+.card{
+  background:var(--paper); border:1px solid var(--line); border-radius:var(--radius);
+  padding:16px; margin-bottom:14px;
+  box-shadow:0 1px 3px rgba(27,42,74,.06);
+}
+.card h2{margin:0 0 10px; font-size:16px}
+.muted{color:var(--muted); font-size:13px}
+.mt{margin-top:10px}
+.row{display:flex; align-items:center}
+.row.between{justify-content:space-between}
+.row.gap{gap:10px}
+.grow{flex:1}
+.stack{display:flex; flex-direction:column; gap:10px}
+.grid2{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+button{
+  font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink);
+  border-radius:10px; padding:10px 14px; cursor:pointer;
+}
+button.primary{background:var(--navy); border-color:var(--navy); color:var(--cream); font-weight:600}
+button.danger{background:#fff; border-color:var(--red); color:var(--red); font-weight:600}
+button.ghost{background:transparent; border-color:transparent; color:inherit}
+button.big{padding:14px; font-size:16px; width:100%}
+.topbar button.ghost{color:var(--cream); border:1px solid rgba(247,243,234,.4)}
+input,select,textarea{
+  font:inherit; width:100%; padding:11px 12px;
+  border:1px solid var(--line); border-radius:10px; background:#fff; color:var(--ink);
+}
+label{display:block; font-size:13px; color:var(--muted); margin-bottom:5px}
+.field{margin-bottom:12px}
+.monthnav{display:flex; align-items:center; justify-content:space-between; margin-bottom:12px}
+.monthnav button{width:44px; height:40px}
+.monthlabel{font-weight:700; font-size:17px; text-transform:capitalize}
+.total-card{background:var(--navy); color:var(--cream); border-color:var(--navy)}
+.total-label{font-size:13px; opacity:.8}
+.total-value{font-size:34px; font-weight:800; margin:4px 0}
+.total-card .muted{color:rgba(247,243,234,.75)}
+.catbar{margin-bottom:10px}
+.catbar-top{display:flex; justify-content:space-between; font-size:14px; margin-bottom:4px}
+.catbar-track{height:10px; background:#eee7d6; border-radius:6px; overflow:hidden}
+.catbar-fill{height:100%; background:var(--accent); border-radius:6px}
+.seg{display:flex; gap:6px; flex-wrap:wrap}
+.seg button{flex:1; padding:9px 6px; font-size:14px; white-space:nowrap}
+.seg button.on{background:var(--navy); color:var(--cream); border-color:var(--navy); font-weight:600}
+.item{
+  display:flex; gap:10px; align-items:center; width:100%; text-align:left;
+  background:#fff; border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:8px;
+}
+.item .thumb{width:44px; height:44px; object-fit:cover; border-radius:8px; flex:none; background:#eee}
+.item .thumb-none{display:flex; align-items:center; justify-content:center; font-size:22px}
+.item-main{flex:1; min-width:0}
+.item-title{font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.item-sub{font-size:12px; color:var(--muted)}
+.item-amount{font-weight:700; white-space:nowrap}
+.badge{font-size:11px; padding:2px 7px; border-radius:20px; background:#eee7d6; color:var(--ink)}
+.badge.overdue{background:#f8d7d2; color:var(--red); font-weight:700}
+.badge.paid{background:#d6efdf; color:var(--green); font-weight:600}
+.month-group{font-weight:700; margin:16px 2px 8px; text-transform:capitalize}
+.photo-preview{width:100%; border-radius:10px; margin-bottom:12px; border:1px solid var(--line)}
+.progress{height:8px; background:#eee7d6; border-radius:6px; overflow:hidden; margin-top:6px}
+.progress>div{height:100%; width:0%; background:var(--navy); transition:width .2s}
+.detail-fields{margin:0}
+.detail-fields div{display:flex; justify-content:space-between; gap:12px; padding:7px 0; border-bottom:1px solid var(--line)}
+.detail-fields dt{color:var(--muted); font-size:13px}
+.detail-fields dd{margin:0; font-weight:600; text-align:right}
+.tabbar{
+  position:fixed; left:0; right:0; bottom:0; z-index:20;
+  display:flex; background:var(--navy); color:var(--cream);
+  padding-bottom:env(safe-area-inset-bottom);
+}
+.tabbar button{
+  flex:1; background:transparent; border:none; color:var(--cream); opacity:.65;
+  display:flex; flex-direction:column; align-items:center; gap:2px;
+  font-size:20px; padding:9px 0 7px; border-radius:0;
+}
+.tabbar button span{font-size:11px}
+.tabbar button.on{opacity:1}
+.tabbar button.add{font-size:26px}
+.overlay{
+  position:fixed; inset:0; z-index:40; background:rgba(10,15,30,.85);
+  display:flex; align-items:center; justify-content:center; padding:16px;
+}
+.overlay-box{background:var(--paper); border-radius:var(--radius); padding:16px; width:100%; max-width:480px}
+.overlay-box video{width:100%; border-radius:10px; background:#000; margin-top:10px}
+.toast{
+  position:fixed; left:50%; transform:translateX(-50%); bottom:100px; z-index:50;
+  background:var(--navy); color:var(--cream); padding:11px 18px; border-radius:24px;
+  font-size:14px; box-shadow:0 4px 14px rgba(0,0,0,.25); max-width:88vw; text-align:center;
+}
+.empty{color:var(--muted); font-size:14px; padding:6px 0}
