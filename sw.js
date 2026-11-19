@@ -1,12 +1,13 @@
 /* Meus Recibos JP — service worker: network-first, offline fallback */
-const CACHE = 'recibos-jp-v1';
+const CACHE = 'recibos-jp-v1-1';
 const SHELL = [
   './',
   './index.html',
   './app.js',
   './styles.css',
   './manifest.webmanifest',
-  './icon.svg'
+  './IMG_6760.png',
+  './IMG_6759.png'
 ];
 
 self.addEventListener('install', (event) => {
