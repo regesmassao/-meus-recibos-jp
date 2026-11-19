@@ -17,6 +17,11 @@
 </header>
 
 <main>
+  <div id="driveNotice" class="notice hidden">
+    <span id="driveNoticeText"></span>
+    <button id="driveNoticeClose" class="ghost" type="button">Fechar aviso</button>
+  </div>
+
   <!-- INÍCIO -->
   <section id="view-home" class="view">
     <div class="monthnav">
@@ -162,6 +167,26 @@
         <button id="btnImport" class="big" type="button">⬆️ Importar backup (JSON)</button>
       </div>
       <p class="muted" id="backupInfo"></p>
+    </div>
+
+    <div class="card">
+      <h2>☁️ Nuvem (Google Drive)</h2>
+      <p class="muted">Guarde o backup num arquivo no SEU Google Drive, usando a sua ponte (script). O app fala só com o seu script: enviar manda o backup atual pra nuvem; baixar junta o backup da nuvem com os dados deste aparelho, sem apagar nada. O link e a chave ficam salvos só neste aparelho — nunca entram no backup exportado.</p>
+      <div class="field">
+        <label for="driveUrl">Link do script</label>
+        <input id="driveUrl" type="url" placeholder="Cole o link do script (termina em /exec)">
+      </div>
+      <div class="field">
+        <label for="driveKey">Chave secreta</label>
+        <input id="driveKey" type="text" placeholder="A mesma chave colocada no script">
+      </div>
+      <div class="stack">
+        <button id="driveSave" class="big" type="button">Salvar link e chave</button>
+        <button id="driveUp" class="primary big" type="button">⬆️ Enviar backup pra nuvem</button>
+        <button id="driveDown" class="big" type="button">⬇️ Baixar da nuvem e juntar</button>
+      </div>
+      <p class="muted" id="driveSync"></p>
+      <p class="muted" id="driveStatus"></p>
     </div>
   </section>
 </main>
