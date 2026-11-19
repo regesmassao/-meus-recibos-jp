@@ -561,8 +561,15 @@ function startQR() {
 }
 
 /* ============ Backup ============ */
+/* O backup carrega SÓ os itens. Link/chave da nuvem (rec-drive*) vivem
+   em outras chaves do localStorage e nunca entram neste arquivo; na
+   importação, só o campo `items` é lido (e cada item passa pela lista
+   branca do sanitizeItem), então nada de configuração viaja junto. */
+function buildBackupPayload() {
+  return { app: 'recibos-jp', version: 1, exportedAt: new Date().toISOString(), items: items };
+}
 function exportBackup() {
-  var payload = JSON.stringify({ app: 'recibos-jp', version: 1, exportedAt: new Date().toISOString(), items: items }, null, 1);
+  var payload = JSON.stringify(buildBackupPayload(), null, 1);
   var blob = new Blob([payload], { type: 'application/json' });
   var a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -573,6 +580,15 @@ function exportBackup() {
   setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
   toast('Backup exportado ✔');
 }
+/* Junta itens vindos de fora (arquivo importado ou nuvem) por id,
+   sem apagar nada local. Mesma lógica para as duas origens. */
+function applyIncomingItems(incoming) {
+  var res = mergeImport(items, incoming);
+  items = res.items;
+  saveItems(items);
+  renderBackupInfo();
+  return res;
+}
 function importBackup(file) {
   var reader = new FileReader();
   reader.onload = function () {
@@ -580,10 +596,7 @@ function importBackup(file) {
       var parsed = JSON.parse(String(reader.result));
       var incoming = Array.isArray(parsed) ? parsed : parsed.items;
       if (!Array.isArray(incoming)) throw new Error('formato');
-      var res = mergeImport(items, incoming);
-      items = res.items;
-      saveItems(items);
-      renderBackupInfo();
+      var res = applyIncomingItems(incoming);
       toast('Importado: ' + res.added + ' novo(s), ' + res.updated + ' atualizado(s). Nada foi apagado.');
     } catch (e) {
       toast('Arquivo inválido. Nenhum dado foi alterado.');
@@ -593,6 +606,136 @@ function importBackup(file) {
 }
 function renderBackupInfo() {
   $('backupInfo').textContent = items.length + (items.length === 1 ? ' item salvo neste aparelho.' : ' itens salvos neste aparelho.');
+}
+
+/* ============ Nuvem (Google Drive) ============ */
+/* Mesma ponte dos outros apps: um Apps Script na conta Google dele
+   guarda UM arquivo de backup no Drive. GET ?key=&action=read devolve
+   {ok, exists, updatedAt, data}; POST ?key=&action=write (corpo = o
+   JSON do backup, como texto puro, pra não disparar preflight de CORS)
+   devolve {ok, updatedAt}. Link e chave ficam salvos só neste aparelho
+   (rec-driveUrl/rec-driveKey), fora de qualquer backup. */
+function driveConfig() {
+  return {
+    url: String(localStorage.getItem('rec-driveUrl') || '').trim(),
+    key: String(localStorage.getItem('rec-driveKey') || '').trim()
+  };
+}
+function driveApiUrl(action) {
+  var c = driveConfig();
+  var sep = c.url.indexOf('?') >= 0 ? '&' : '?';
+  return c.url + sep + 'key=' + encodeURIComponent(c.key) + '&action=' + action;
+}
+function driveSetStatus(msg) {
+  var el = $('driveStatus');
+  if (el) el.textContent = msg;
+}
+function driveFmtWhen(ts) {
+  var n = Number(ts || 0);
+  return n > 0 ? new Date(n).toLocaleString('pt-BR') : 'nunca';
+}
+function driveRenderSync() {
+  var el = $('driveSync');
+  if (!el) return;
+  el.textContent = 'Envio: ' + driveFmtWhen(localStorage.getItem('rec-driveLastUp')) +
+    ' · Baixa: ' + driveFmtWhen(localStorage.getItem('rec-driveLastDown'));
+}
+function driveSaveConfig() {
+  localStorage.setItem('rec-driveUrl', String($('driveUrl').value || '').trim());
+  localStorage.setItem('rec-driveKey', String($('driveKey').value || '').trim());
+  driveSetStatus('✔️ Link e chave salvos neste aparelho.');
+  driveCheckOnOpen();
+}
+function driveFetchJson(url, options) {
+  var p;
+  try { p = fetch(url, options); } catch (e) { p = Promise.reject(e); }
+  return p.then(function (res) {
+    return res.json().catch(function () { return null; });
+  }).then(function (body) {
+    if (!body || body.ok !== true) {
+      if (body && body.error === 'unauthorized') throw new Error('unauthorized');
+      throw new Error('network');
+    }
+    return body;
+  }).catch(function (e) {
+    if (e && e.message === 'unauthorized') throw e;
+    throw new Error('network');
+  });
+}
+function driveErrorToast(e) {
+  toast(e && e.message === 'unauthorized'
+    ? '❌ O script recusou a chave. Confira se a chave salva aqui é igual à chave do script.'
+    : '❌ Não consegui falar com o script. Confira o link e a conexão com a internet.');
+}
+function driveUpload() {
+  var c = driveConfig();
+  if (!c.url || !c.key) { toast('Primeiro cole o link do script e a chave secreta, e toque em Salvar.'); return; }
+  driveSetStatus('Enviando pra nuvem…');
+  driveFetchJson(driveApiUrl('write'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(buildBackupPayload())
+  }).then(function (r) {
+    localStorage.setItem('rec-driveLastUp', String(Date.now()));
+    if (r.updatedAt) localStorage.setItem('rec-driveRemoteAt', String(r.updatedAt));
+    driveSetStatus('✔️ Backup enviado pra nuvem com ' + items.length + (items.length === 1 ? ' item.' : ' itens.'));
+    toast('Backup enviado pra nuvem ✔');
+    driveRenderSync();
+    driveHideNotice();
+  }).catch(function (e) {
+    driveSetStatus('');
+    driveErrorToast(e);
+  });
+}
+function driveDownload() {
+  var c = driveConfig();
+  if (!c.url || !c.key) { toast('Primeiro cole o link do script e a chave secreta, e toque em Salvar.'); return; }
+  driveSetStatus('Consultando a nuvem…');
+  driveFetchJson(driveApiUrl('read'), { method: 'GET' }).then(function (r) {
+    if (!r.exists || !r.data) {
+      driveSetStatus('Ainda não há backup na nuvem. Envie o primeiro pelo botão de enviar.');
+      return;
+    }
+    var data = r.data;
+    if (!data || typeof data !== 'object' || data.app !== 'recibos-jp' || !Array.isArray(data.items)) {
+      driveSetStatus('❌ O que veio da nuvem não é um backup válido. Nada foi alterado.');
+      return;
+    }
+    /* Mesma junção do importar arquivo: merge por id, nunca apaga. */
+    var res = applyIncomingItems(data.items);
+    localStorage.setItem('rec-driveLastDown', String(Date.now()));
+    if (r.updatedAt) localStorage.setItem('rec-driveRemoteAt', String(r.updatedAt));
+    driveSetStatus('');
+    driveRenderSync();
+    driveHideNotice();
+    renderHome();
+    toast('Baixado da nuvem: ' + res.added + ' novo(s), ' + res.updated + ' atualizado(s). Nada foi apagado.');
+  }).catch(function (e) {
+    driveSetStatus('');
+    driveErrorToast(e);
+  });
+}
+function driveShowNotice(iso) {
+  var box = $('driveNotice'), txt = $('driveNoticeText');
+  if (!box || !txt) return;
+  var d = iso ? new Date(iso) : null;
+  txt.textContent = '☁️ Há um backup mais novo na nuvem (de ' +
+    (d && !isNaN(d.getTime()) ? d.toLocaleString('pt-BR') : String(iso || '')) +
+    '). Se quiser trazer pra este aparelho, abra Backup → “Baixar da nuvem e juntar”.';
+  box.classList.remove('hidden');
+}
+function driveHideNotice() {
+  var box = $('driveNotice');
+  if (box) box.classList.add('hidden');
+}
+function driveCheckOnOpen() {
+  var c = driveConfig();
+  if (!c.url || !c.key) return;
+  driveFetchJson(driveApiUrl('read'), { method: 'GET' }).then(function (r) {
+    if (!r.exists || !r.updatedAt) return;
+    var known = String(localStorage.getItem('rec-driveRemoteAt') || '');
+    if (String(r.updatedAt) !== known) driveShowNotice(r.updatedAt);
+  }).catch(function () { /* silencioso: abrir o app nunca mostra erro da nuvem */ });
 }
 
 /* ============ Inicialização ============ */
@@ -607,7 +750,7 @@ function bindEvents() {
   $('tabHome').onclick = function () { renderHome(); showView('home'); };
   $('tabAdd').onclick = function () { showView('add'); };
   $('tabHistory').onclick = function () { renderHistory(); showView('history'); };
-  $('btnBackup').onclick = function () { renderBackupInfo(); showView('backup'); };
+  $('btnBackup').onclick = function () { renderBackupInfo(); driveRenderSync(); showView('backup'); };
 
   $('monthPrev').onclick = function () {
     viewMonth.m--; if (viewMonth.m < 0) { viewMonth.m = 11; viewMonth.y--; } renderHome();
@@ -680,6 +823,11 @@ function bindEvents() {
   $('btnExport').onclick = exportBackup;
   $('btnImport').onclick = function () { $('fileImport').click(); };
   $('fileImport').onchange = function () { if (this.files[0]) importBackup(this.files[0]); this.value = ''; };
+
+  $('driveSave').onclick = driveSaveConfig;
+  $('driveUp').onclick = driveUpload;
+  $('driveDown').onclick = driveDownload;
+  $('driveNoticeClose').onclick = driveHideNotice;
 }
 
 function init() {
@@ -688,8 +836,12 @@ function init() {
   viewMonth = { y: now.getFullYear(), m: now.getMonth() };
   fillSelects();
   bindEvents();
+  $('driveUrl').value = localStorage.getItem('rec-driveUrl') || '';
+  $('driveKey').value = localStorage.getItem('rec-driveKey') || '';
+  driveRenderSync();
   renderHome();
   showView('home');
+  driveCheckOnOpen();
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(function () {});
   }
@@ -706,6 +858,7 @@ if (typeof module !== 'undefined' && module.exports) {
     extractFromText: extractFromText, classifyType: classifyType,
     extractAmount: extractAmount, findAllDates: findAllDates,
     fmtYen: fmtYen, fmtDateBR: fmtDateBR, mergeImport: mergeImport,
-    sanitizeItem: sanitizeItem, CATEGORIES: CATEGORIES
+    sanitizeItem: sanitizeItem, CATEGORIES: CATEGORIES,
+    buildBackupPayload: buildBackupPayload
   };
 }
