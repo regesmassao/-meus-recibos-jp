@@ -31,14 +31,31 @@
     </div>
 
     <div class="card total-card">
-      <div class="total-label">Gastos (recibos) no mês</div>
+      <div class="total-label">Gasto do mês (recibos)</div>
       <div id="monthTotal" class="total-value">¥0</div>
-      <div id="monthCount" class="muted"></div>
+      <div class="kpis">
+        <div class="kpi"><div class="kpi-value" id="kpiReceipts">0</div><div class="kpi-label">recibos</div></div>
+        <div class="kpi"><div class="kpi-value" id="kpiPlaces">0</div><div class="kpi-label">lugares</div></div>
+        <div class="kpi"><div class="kpi-value" id="kpiAvg">¥0</div><div class="kpi-label">ticket médio</div></div>
+      </div>
     </div>
 
     <div class="card">
-      <h2>Para onde foi o dinheiro</h2>
+      <h2>Gasto por categoria</h2>
       <div id="catBars"></div>
+      <p class="muted">Toque numa categoria pra ver os recibos dela.</p>
+    </div>
+
+    <div class="card">
+      <h2>Top lugares do mês</h2>
+      <div id="topPlaces"></div>
+      <p class="muted">Toque num lugar pra abrir a agenda dele.</p>
+    </div>
+
+    <div class="card">
+      <h2>Gasto por mês</h2>
+      <div id="monthBars"></div>
+      <p class="muted">Toque num mês pra ver o painel dele.</p>
     </div>
 
     <div class="card">
@@ -152,6 +169,34 @@
     <div id="historyList"></div>
   </section>
 
+  <!-- LUGARES -->
+  <section id="view-places" class="view hidden">
+    <div class="card">
+      <h2>📍 Lugares</h2>
+      <p class="muted">Sua agenda pessoal de lugares: cada loja e restaurante, com visitas e somas.</p>
+      <div class="seg" id="placeYears"></div>
+    </div>
+    <div id="placesList"></div>
+  </section>
+
+  <!-- DETALHE DO LUGAR -->
+  <section id="view-place" class="view hidden">
+    <div class="card">
+      <button id="btnBackPlace" class="ghost" type="button">← Voltar</button>
+      <h2 id="pTitle">—</h2>
+      <div id="pPhoneBox" class="hidden"></div>
+      <dl id="pFields" class="detail-fields"></dl>
+    </div>
+    <div class="card hidden" id="pBranchesWrap">
+      <h2>Filiais</h2>
+      <div id="pBranches"></div>
+    </div>
+    <div class="card">
+      <h2>Recibos deste lugar</h2>
+      <div id="pItems"></div>
+    </div>
+  </section>
+
   <!-- DETALHE -->
   <section id="view-detail" class="view hidden">
     <div class="card">
@@ -204,6 +249,7 @@
 <nav class="tabbar">
   <button id="tabHome" type="button" class="on">🏠<span>Início</span></button>
   <button id="tabAdd" type="button" class="add">＋<span>Adicionar</span></button>
+  <button id="tabPlaces" type="button">📍<span>Lugares</span></button>
   <button id="tabHistory" type="button">🗂️<span>Histórico</span></button>
 </nav>
 
