@@ -1,4 +1,4 @@
-/* Meus Recibos JP — v1.4
+/* Meus Recibos JP — v1.5
    Tudo fica no aparelho (localStorage, prefixo rec-). Nada é enviado a terceiros.
    A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn).
    v1.3: extração reforçada (nome fantasia, total/valor pago/troco) e
@@ -6,7 +6,13 @@
    v1.4: cada item ganha lugar (place), filial (branch) e telefone; nova
    aba Lugares agrupando visitas por categoria → lugar → filial, com
    filtro por ano; histórico agrupado por ano — uma agenda pessoal de
-   lugares. */
+   lugares.
+   v1.5: OCR refeito — a foto é recortada na faixa do papel (fundo escuro
+   virava ruído), ganha contraste e é lida em 3 passadas (PSM 4) em
+   escalas/recortes diferentes, com os textos combinados; extração
+   tolerante a erros típicos do OCR (0→C/Z no ano, "/"→7 na data,
+   "2.900" com ponto, お預り sem o 預 legível, 9 lido como 3 etc.).
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.5.md (fora do repo). */
 'use strict';
 
 /* ============ Constantes ============ */
@@ -75,6 +81,45 @@ function findAllDates(text) {
   while ((m = re3.exec(text)) !== null) {
     out.push(toISODate(2018 + (+m[1]), +m[2], +m[3]));
   }
+  // Passada tolerante (v1.5): o OCR troca dígitos por letras parecidas
+  // (0→O/C, 2→Z) e a "/" do mês/dia por "7" — ex.: "2CZ26/11720" é
+  // 2026/11/20. Só entra se a forma estrita não achou a mesma data.
+  var tol = findTolerantDates(text);
+  for (var i = 0; i < tol.length; i++) {
+    if (out.indexOf(tol[i]) < 0) out.push(tol[i]);
+  }
+  return out;
+}
+
+/* Ano a partir de um token "sujo" do OCR: corrige O/C→0 e Z→2, desfaz
+   um dígito duplicado ("20226"→"2026") e exige 2015–2035. */
+function yearFromOcrToken(tok) {
+  var d = String(tok).replace(/[OoCc]/g, '0').replace(/[Zz]/g, '2');
+  if (!/^\d{4,5}$/.test(d)) return null;
+  if (d.length === 5) d = d.replace(/(\d)\1/, '$1');
+  if (d.length !== 4) return null;
+  var y = parseInt(d, 10);
+  return (y >= 2015 && y <= 2035) ? y : null;
+}
+
+function findTolerantDates(text) {
+  var out = [];
+  var m;
+  var reA = /([0-9OoCcZz]{4,5})\s*[\/.-]\s*(\d{1,2})\s*[\/.-]\s*(\d{1,2})/g;
+  while ((m = reA.exec(text)) !== null) {
+    var y = yearFromOcrToken(m[1]);
+    if (y === null) continue;
+    var mo = +m[2], da = +m[3];
+    if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) out.push(toISODate(y, mo, da));
+  }
+  // "/" entre mês e dia lida como "7": "2026/11720" = 2026/11/20
+  var reB = /([0-9OoCcZz]{4,5})\s*[\/.-]\s*(\d{2})[7](\d{2})(?!\d)/g;
+  while ((m = reB.exec(text)) !== null) {
+    var y2 = yearFromOcrToken(m[1]);
+    if (y2 === null) continue;
+    var mo2 = +m[2], da2 = +m[3];
+    if (mo2 >= 1 && mo2 <= 12 && da2 >= 1 && da2 <= 31) out.push(toISODate(y2, mo2, da2));
+  }
   return out;
 }
 
@@ -98,13 +143,43 @@ function normalizeOcr(text) {
   return t;
 }
 
+/* Converte um token numérico do OCR: "2,900" e "2.900" (ponto como
+   separador de milhar, comum em recibo térmico) viram 2900; um token
+   com ponto decimal ("22.46") fica com a parte inteira. */
+function parseNumToken(tok) {
+  tok = String(tok);
+  if (/^\d{1,3}([.,]\d{3})+$/.test(tok)) {
+    return parseInt(tok.replace(/[.,]/g, ''), 10);
+  }
+  var v = parseInt(tok.split('.')[0].replace(/,/g, ''), 10);
+  return isNaN(v) ? null : v;
+}
+
 /* Todos os números de uma linha (sem ¥ nem vírgulas). */
 function numbersInLine(line) {
   var out = [];
-  var re = /[0-9][0-9,]*[0-9]|[0-9]/g, m;
+  var re = /[0-9][0-9,.]*[0-9]|[0-9]/g, m;
   while ((m = re.exec(String(line))) !== null) {
-    var v = parseInt(m[0].replace(/,/g, ''), 10);
-    if (!isNaN(v)) out.push(v);
+    var v = parseNumToken(m[0]);
+    if (v !== null) out.push(v);
+  }
+  return out;
+}
+
+/* Versão tolerante, só para linhas de dinheiro: letras que o OCR troca
+   por dígitos entram no token (O/U→0, I/l→1) — "fIUU" vira 100 e
+   "2.90O" vira 2900. Tokens sem nenhum dígito de verdade e curtos
+   ("No", "TEL") são ignorados. */
+function numbersInLineFuzzy(line) {
+  var out = [];
+  var re = /[0-9OoUuIl][0-9OoUuIl,.]*[0-9OoUuIl]|[0-9OoUuIl]/g, m;
+  var s = String(line);
+  while ((m = re.exec(s)) !== null) {
+    var tok = m[0];
+    if (!/[0-9]/.test(tok) && tok.length < 3) continue;
+    var mapped = tok.replace(/[OoUu]/g, '0').replace(/[Il]/g, '1');
+    var v = parseNumToken(mapped);
+    if (v !== null) out.push(v);
   }
   return out;
 }
@@ -118,9 +193,9 @@ function moneyByKeywords(lines, keywords) {
     for (var k = 0; k < keywords.length; k++) {
       var pos = stripped.indexOf(keywords[k]);
       if (pos < 0) continue;
-      var nums = numbersInLine(stripped.slice(pos + keywords[k].length));
-      if (!nums.length) nums = numbersInLine(lines[i]);
-      if (!nums.length && i + 1 < lines.length) nums = numbersInLine(lines[i + 1]);
+      var nums = numbersInLineFuzzy(stripped.slice(pos + keywords[k].length));
+      if (!nums.length) nums = numbersInLineFuzzy(lines[i]);
+      if (!nums.length && i + 1 < lines.length) nums = numbersInLineFuzzy(lines[i + 1]);
       if (nums.length) return Math.max.apply(null, nums);
     }
   }
@@ -132,12 +207,53 @@ var TOTAL_KEYWORDS = ['合計金額', '税込合計', 'お買上計', 'お買い
 var TENDERED_KEYWORDS = ['お預かり金', 'お預かり', 'お預り', '預り金'];
 var CHANGE_KEYWORDS = ['お釣り', 'おつり', '釣銭', '釣り銭'];
 
+/* Linhas "お?り": o recibo imprime お預り (valor entregue) e depois
+   お釣り (troco), mas o OCR troca o kanji do meio (お聞り, お約り…).
+   Devolve as linhas nesse formato, em ordem, com os valores lidos. */
+function ojiriLines(lines) {
+  var out = [];
+  for (var i = 0; i < lines.length; i++) {
+    var s = lines[i].replace(/\s/g, '');
+    if (/^お.り/.test(s)) out.push({ idx: i, nums: numbersInLineFuzzy(lines[i]) });
+  }
+  return out;
+}
+
+/* Valores candidatos de uma linha de troco: além do número lido, um
+   token como "1IUU" pode ser o "¥" colado no valor (¥100 lido como
+   1100) — gera também a variante sem o primeiro dígito. */
+function changeCandidates(line) {
+  var out = numbersInLineFuzzy(line);
+  var extra = [];
+  for (var i = 0; i < out.length; i++) {
+    if (out[i] >= 1000 && out[i] % 1000 !== 0) extra.push(out[i] % 1000);
+  }
+  for (var j = 0; j < extra.length; j++) {
+    if (extra[j] > 0 && out.indexOf(extra[j]) < 0) out.push(extra[j]);
+  }
+  return out;
+}
+
 /* Extrai total, valor entregue (お預かり) e troco (お釣り) do texto.
-   tendered/change ficam null quando não aparecem no papel. */
+   tendered/change ficam null quando não aparecem no papel.
+   v1.5: total também via 小計 e, em último caso, via um 計 solto;
+   tendered/change combinam palavra-chave, linhas お?り e a conta
+   tendered − total = troco quando as evidências concordam. */
 function extractMoney(rawText) {
   var text = normalizeOcr(rawText);
   var lines = text.split(/\n/);
   var amount = moneyByKeywords(lines, TOTAL_KEYWORDS);
+  if (amount === null) amount = moneyByKeywords(lines, ['小計']);
+  if (amount === null) {
+    for (var i = 0; i < lines.length; i++) {
+      var st = lines[i].replace(/\s/g, '');
+      if (st.indexOf('計') < 0 || st.indexOf('対象計') >= 0) continue;
+      var ns = numbersInLineFuzzy(lines[i]).filter(function (v) {
+        return v >= 100 && v < 50000;
+      });
+      if (ns.length) { amount = Math.max.apply(null, ns); break; }
+    }
+  }
   if (amount === null) {
     var maxY = null, m;
     var reY = /¥\s*([0-9][0-9,]*)/g;
@@ -156,11 +272,62 @@ function extractMoney(rawText) {
     }
     amount = maxE;
   }
-  return {
-    amount: amount,
-    tendered: moneyByKeywords(lines, TENDERED_KEYWORDS),
-    change: moneyByKeywords(lines, CHANGE_KEYWORDS)
-  };
+
+  var tenderedKw = moneyByKeywords(lines, TENDERED_KEYWORDS);
+  var changeKw = moneyByKeywords(lines, CHANGE_KEYWORDS);
+  var ojiri = ojiriLines(lines);
+
+  /* Valor entregue e troco: as linhas お?り das várias passadas se
+     misturam (cada passada traz o seu par お預り/お釣り). Com o total
+     conhecido, separa pelo valor: candidato a entregue cobre o total;
+     candidato a troco é menor que o total. Sem total, vale a ordem do
+     papel: a primeira linha お?り é a do entregue. */
+  var tendered = null;
+  var cCands = [];
+  var hasChangeLine = changeKw !== null;
+  if (amount !== null) {
+    var tPool = [];
+    if (tenderedKw !== null && tenderedKw >= amount) tPool.push(tenderedKw);
+    ojiri.forEach(function (o) {
+      o.nums.forEach(function (v) {
+        if (v >= amount) { if (tPool.indexOf(v) < 0) tPool.push(v); }
+      });
+      changeCandidates(lines[o.idx]).forEach(function (v) {
+        if (v > 0 && v < amount && cCands.indexOf(v) < 0) cCands.push(v);
+      });
+      if (o.nums.length) hasChangeLine = true;
+    });
+    if (tPool.length) tendered = Math.min.apply(null, tPool);
+    if (changeKw !== null && changeKw < amount && cCands.indexOf(changeKw) < 0) {
+      cCands.push(changeKw);
+    }
+  } else {
+    if (tenderedKw !== null) tendered = tenderedKw;
+    else if (ojiri.length && ojiri[0].nums.length) {
+      tendered = Math.max.apply(null, ojiri[0].nums);
+    }
+    if (changeKw !== null) cCands.push(changeKw);
+    for (var o = 1; o < ojiri.length; o++) {
+      hasChangeLine = true;
+      changeCandidates(lines[ojiri[o].idx]).forEach(function (v) {
+        if (v > 0 && cCands.indexOf(v) < 0) cCands.push(v);
+      });
+    }
+  }
+
+  /* Troco: se algum candidato bate com tendered − total, ele vence;
+     senão, um candidato único é aceito como lido; senão, a aritmética
+     vale quando há linha de troco e o resultado é plausível (troco
+     menor que o total). */
+  var expected = (tendered !== null && amount !== null && tendered >= amount)
+    ? tendered - amount : null;
+  var change = null;
+  if (expected !== null && cCands.indexOf(expected) >= 0) change = expected;
+  else if (cCands.length === 1) change = cCands[0];
+  else if (expected !== null && hasChangeLine && expected < amount && expected <= 5000) change = expected;
+  else if (cCands.length) change = cCands[0];
+
+  return { amount: amount, tendered: tendered, change: change };
 }
 
 function extractAmount(text) {
@@ -175,15 +342,43 @@ function classifyType(text) {
   for (var j = 0; j < PROMO_KEYWORDS.length; j++) {
     if (t.indexOf(PROMO_KEYWORDS[j]) >= 0) return 'promocao';
   }
-  if (t.indexOf('%') >= 0 || t.indexOf('％') >= 0) return 'promocao';
+  if (t.indexOf('%') >= 0 || t.indexOf('％') >= 0) {
+    /* Recibo de restaurante/supermercado traz "10%対象計" — o "%"
+       sozinho não faz dele promoção; só vira promoção se o papel não
+       tiver cara de recibo. */
+    if (!/合計|小計|領収|お預|お釣|釣銭/.test(t)) return 'promocao';
+  }
   return 'recibo';
 }
 
 function guessCategory(text) {
-  for (var i = 0; i < CATEGORY_HINTS.length; i++) {
-    if (CATEGORY_HINTS[i][0].test(text)) return CATEGORY_HINTS[i][1];
+  /* O OCR enfia espaços e até dígitos no meio dos nomes ("サイ ゼ リ
+     ヤ", "サイ1ゼリヤ") — testa o texto cru, sem espaços, sem
+     símbolos e, por fim, só kana/kanji. */
+  var raw = String(text || '');
+  var variants = [raw, raw.replace(/\s/g, ''),
+    raw.replace(/[^ぁ-んァ-ヶー一-龯A-Za-z0-9]/g, ''),
+    raw.replace(/[^ぁ-んァ-ヶー一-龯]/g, '')];
+  for (var v = 0; v < variants.length; v++) {
+    for (var i = 0; i < CATEGORY_HINTS.length; i++) {
+      if (CATEGORY_HINTS[i][0].test(variants[v])) return CATEGORY_HINTS[i][1];
+    }
   }
   return 'Outros';
+}
+
+/* Procura o nome de uma rede no texto, tolerante ao ruído do OCR:
+   compara o texto sem espaços, a versão sem símbolos e a versão só
+   kana/kanji (que apaga até dígito enfiado no meio do nome). */
+function chainHit(text, needle) {
+  var n1 = String(needle).replace(/\s/g, '');
+  if (String(text).replace(/\s/g, '').indexOf(n1) >= 0) return true;
+  var n2 = n1.replace(/[^ぁ-んァ-ヶー一-龯A-Za-z0-9]/g, '');
+  var clean = String(text).replace(/[^ぁ-んァ-ヶー一-龯A-Za-z0-9]/g, '');
+  if (n2.length >= 2 && clean.indexOf(n2) >= 0) return true;
+  var nK = n1.replace(/[^ぁ-んァ-ヶー一-龯]/g, '');
+  var cleanK = String(text).replace(/[^ぁ-んァ-ヶー一-龯]/g, '');
+  return nK.length >= 2 && cleanK.indexOf(nK) >= 0;
 }
 
 /* Redes conhecidas: [trecho procurado no texto sem espaços, nome exibido].
@@ -231,9 +426,8 @@ function isJunkStoreLine(s) {
 
 function extractStore(rawText) {
   var text = normalizeOcr(rawText);
-  var flatAll = text.replace(/\s/g, '');
   for (var i = 0; i < CHAIN_NAMES.length; i++) {
-    if (flatAll.indexOf(CHAIN_NAMES[i][0].replace(/\s/g, '')) >= 0) return CHAIN_NAMES[i][1];
+    if (chainHit(text, CHAIN_NAMES[i][0])) return CHAIN_NAMES[i][1];
   }
   var lines = text.split(/\n/);
   var legalFallback = '';
@@ -272,6 +466,20 @@ function extractPhone(rawText) {
       if (digits.length >= 10 && digits.length <= 11) return m[0].replace(/\s/g, '-');
     }
   }
+  /* Tolerante (v1.5): separador lido como "." ou espaço no meio do
+     grupo e letras trocadas por dígitos (O/U→0) — ex.: "045-503 2 33U".
+     Reconstrói o número pelos dígitos, no agrupamento japonês comum. */
+  var m2 = /0[0-9OoUu][0-9OoUu .-]{6,}[0-9OoUu]/.exec(text);
+  if (m2) {
+    var digs = m2[0].replace(/[Oo]/g, '0').replace(/[Uu]/g, '0').replace(/[^0-9]/g, '');
+    if (digs.length === 10) {
+      if (/^0[36]/.test(digs)) return digs.slice(0, 2) + '-' + digs.slice(2, 6) + '-' + digs.slice(6);
+      return digs.slice(0, 3) + '-' + digs.slice(3, 6) + '-' + digs.slice(6);
+    }
+    if (digs.length === 11) {
+      return digs.slice(0, 3) + '-' + digs.slice(3, 7) + '-' + digs.slice(7);
+    }
+  }
   return '';
 }
 
@@ -284,10 +492,9 @@ function extractPhone(rawText) {
 function extractPlaceInfo(rawText) {
   var text = normalizeOcr(rawText);
   var lines = text.split(/\n/);
-  var flatAll = text.replace(/\s/g, '');
   for (var i = 0; i < CHAIN_NAMES.length; i++) {
     var needle = CHAIN_NAMES[i][0].replace(/\s/g, '');
-    if (flatAll.indexOf(needle) < 0) continue;
+    if (!chainHit(text, CHAIN_NAMES[i][0])) continue;
     var display = CHAIN_NAMES[i][1];
     var branch = '';
     for (var j = 0; j < lines.length && !branch; j++) {
@@ -302,11 +509,22 @@ function extractPlaceInfo(rawText) {
       }
     }
     if (!branch) {
+      /* Filial "…駅前" (ex.: 生麦駅前) numa linha do cabeçalho. */
+      for (var e = 0; e < Math.min(lines.length, 10) && !branch; e++) {
+        var se = lines[e].replace(/\s/g, '');
+        var me = /[ぁ-んァ-ヶー一-龯]{1,4}駅前/.exec(se);
+        if (me) branch = me[0];
+      }
+    }
+    if (!branch) {
       for (var k = 0; k < Math.min(lines.length, 8); k++) {
         var s = lines[k].trim().replace(/\s/g, '');
         if (s.length < 3 || s.length > 14) continue;
         if (!/店$/.test(s)) continue;
-        if (/合計|小計|TEL|電話/.test(s)) continue;
+        /* Só kana/kanji: linha de cabeçalho de documento (領収証…)
+           lida errado pelo OCR não é filial. */
+        if (!/^[ぁ-んァ-ヶー一-龯]+店$/.test(s)) continue;
+        if (/合計|小計|TEL|電話|領収|請求|頁/.test(s)) continue;
         if (s.indexOf(needle) >= 0) continue;
         branch = s;
         break;
@@ -973,33 +1191,220 @@ function downscaleImage(file, cb) {
   img.onerror = function () { URL.revokeObjectURL(url); toast('Não consegui abrir essa imagem.'); };
   img.src = url;
 }
+/* ============ Preparação da foto pro OCR (v1.5) ============
+   A foto crua reprova: o recibo é uma faixa clara e estreita sobre
+   um fundo escuro e texturizado, e o Tesseract perde a segmentação
+   (o fundo vira páginas de ruído e o texto miúdo some). A preparação:
+   1. acha a faixa do papel pelo brilho médio das colunas/linhas;
+   2. gera variantes em cinza com contraste esticado e borda branca,
+      em escalas e recortes diferentes (cabeçalho, recibo inteiro,
+      zona dos totais) — cada passada lê melhor uma parte;
+   3. lê as variantes com PSM 4 e junta os textos pra extração. */
+
+/* Acha a caixa do papel (recorte "solto" e "folgado") ou null.
+   Analisa uma cópia de 200px de largura: papel é a maior sequência
+   de colunas/linhas com brilho médio acima do meio-termo. */
+function detectPaperBoxes(img) {
+  var W = img.naturalWidth, H = img.naturalHeight;
+  if (!W || !H) return null;
+  var aw = 200, ah = Math.max(1, Math.round(H * aw / W));
+  var cv = document.createElement('canvas');
+  cv.width = aw; cv.height = ah;
+  var cx = cv.getContext('2d');
+  cx.drawImage(img, 0, 0, aw, ah);
+  var data;
+  try {
+    data = cx.getImageData(0, 0, aw, ah).data;
+  } catch (e) { return null; }
+  function lum(x, y) {
+    var p = (y * aw + x) * 4;
+    return (data[p] * 299 + data[p + 1] * 587 + data[p + 2] * 114) / 1000;
+  }
+  function axisRun(means) {
+    var mn = Infinity, mx = -Infinity, i;
+    for (i = 0; i < means.length; i++) {
+      if (means[i] < mn) mn = means[i];
+      if (means[i] > mx) mx = means[i];
+    }
+    if (mx < 140) return null;
+    var thr = (mn + mx) / 2;
+    var best = null, cur = null;
+    for (i = 0; i < means.length; i++) {
+      if (means[i] > thr && cur === null) cur = i;
+      if ((means[i] <= thr || i === means.length - 1) && cur !== null) {
+        var end = (means[i] <= thr) ? i : i + 1;
+        if (!best || end - cur > best[1] - best[0]) best = [cur, end];
+        cur = null;
+      }
+    }
+    if (!best) return null;
+    var len = best[1] - best[0];
+    if (len < means.length * 0.25 || len >= means.length * 0.97) return null;
+    return best;
+  }
+  var colMeans = [], rowMeans = [], x, y, s;
+  for (x = 0; x < aw; x++) {
+    s = 0;
+    for (y = 0; y < ah; y++) s += lum(x, y);
+    colMeans.push(s / ah);
+  }
+  for (y = 0; y < ah; y++) {
+    s = 0;
+    for (x = 0; x < aw; x++) s += lum(x, y);
+    rowMeans.push(s / aw);
+  }
+  var runX = axisRun(colMeans), runY = axisRun(rowMeans);
+  function toBox(rx, ry, padFrac) {
+    var x0 = rx ? rx[0] : 0, x1 = rx ? rx[1] : aw;
+    var y0 = ry ? ry[0] : 0, y1 = ry ? ry[1] : ah;
+    var px = Math.round((x1 - x0) * padFrac), py = Math.round((y1 - y0) * padFrac);
+    x0 = Math.max(0, x0 - px); x1 = Math.min(aw, x1 + px);
+    y0 = Math.max(0, y0 - py); y1 = Math.min(ah, y1 + py);
+    return {
+      x: Math.round(x0 / aw * W), y: Math.round(y0 / ah * H),
+      w: Math.round((x1 - x0) / aw * W), h: Math.round((y1 - y0) / ah * H)
+    };
+  }
+  if (!runX && !runY) return null;
+  return { tight: toBox(runX, runY, 0.06), wide: toBox(runX, runY, 0.12) };
+}
+
+/* Desenha o recorte em cinza, com contraste esticado (mín/máx) e
+   borda branca, escalado pra largura alvo (altura máx. 3600px). */
+function makeOcrVariant(img, box, targetW) {
+  var scale = targetW / box.w;
+  if (box.h * scale > 3600) scale = 3600 / box.h;
+  var w = Math.max(50, Math.round(box.w * scale));
+  var h = Math.max(50, Math.round(box.h * scale));
+  var cv = document.createElement('canvas');
+  cv.width = w + 48; cv.height = h + 48;
+  var cx = cv.getContext('2d');
+  cx.fillStyle = '#ffffff';
+  cx.fillRect(0, 0, cv.width, cv.height);
+  cx.drawImage(img, box.x, box.y, box.w, box.h, 24, 24, w, h);
+  var id = cx.getImageData(0, 0, cv.width, cv.height);
+  var d = id.data;
+  var mn = 255, mx = 0, i, g;
+  for (i = 0; i < d.length; i += 4) {
+    g = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000;
+    d[i] = g;
+    if (g < mn) mn = g;
+    if (g > mx) mx = g;
+  }
+  var range = mx - mn;
+  for (i = 0; i < d.length; i += 4) {
+    var v = d[i];
+    if (range >= 30) v = Math.max(0, Math.min(255, (v - mn) * 255 / range));
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  cx.putImageData(id, 0, 0);
+  return cv.toDataURL('image/jpeg', 0.9);
+}
+
+function loadImageEl(src) {
+  return new Promise(function (resolve, reject) {
+    var img = new Image();
+    img.onload = function () { resolve(img); };
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+/* Lê as variantes com um worker só, trocando o PSM por passada. */
+function ocrPasses(variants, onPass) {
+  return Tesseract.createWorker('jpn', 1, {
+    logger: function (m) {
+      if (m.status === 'recognizing text' && onPass) onPass(m.progress);
+    }
+  }).then(function (worker) {
+    var text = '';
+    var chain = Promise.resolve();
+    variants.forEach(function (v, idx) {
+      chain = chain.then(function () {
+        if (onPass) onPass(0, idx + 1, variants.length);
+        return worker.setParameters({ tessedit_pageseg_mode: v.psm })
+          .then(function () { return worker.recognize(v.img); })
+          .then(function (res) {
+            text += '\n' + ((res && res.data && res.data.text) || '');
+          });
+      });
+    });
+    return chain.then(function () {
+      return worker.terminate().then(function () { return text; });
+    }, function (err) {
+      try { worker.terminate(); } catch (e) {}
+      throw err;
+    });
+  });
+}
+
+/* Pipeline completo: prepara as variantes e lê. Se o telefone não
+   sair nas passadas PSM 4, tenta uma passada extra em PSM automático
+   na variante folgada (ela lê melhor a linha do TEL). */
+function prepareAndOcr(dataUrl) {
+  return loadImageEl(dataUrl).then(function (img) {
+    var boxes = detectPaperBoxes(img);
+    var full = { x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight };
+    var tight = boxes ? boxes.tight : full;
+    var wide = boxes ? boxes.wide : full;
+    var totals = {
+      x: tight.x, y: Math.round(tight.y + tight.h * 0.53),
+      w: tight.w, h: Math.round(tight.h * 0.47)
+    };
+    var variants = [
+      { img: makeOcrVariant(img, tight, 1100), psm: '4' },
+      { img: makeOcrVariant(img, wide, 1650), psm: '4' },
+      { img: makeOcrVariant(img, totals, 1500), psm: '4' }
+    ];
+    var totalPasses = variants.length;
+    return ocrPasses(variants, function (progress, passIdx, passCount) {
+      if (passIdx) {
+        $('ocrStatus').textContent = 'Lendo a foto… parte ' + passIdx + ' de ' + passCount;
+        $('ocrBar').style.width = Math.round((passIdx - 1) / passCount * 100) + '%';
+      } else if (typeof progress === 'number') {
+        $('ocrBar').style.width = Math.min(99, Math.round(progress * 100)) + '%';
+      }
+    }).then(function (merged) {
+      if (extractPhone(merged)) return merged;
+      var extra = [{ img: makeOcrVariant(img, wide, 1100), psm: '3' }];
+      return ocrPasses(extra, null).then(function (t) {
+        return merged + '\n' + t;
+      }, function () { return merged; });
+    });
+  });
+}
+
 function runOCR(dataUrl) {
   var box = $('ocrBox');
   box.classList.remove('hidden');
-  $('ocrStatus').textContent = 'Lendo a foto… (pode levar alguns segundos)';
+  $('ocrStatus').textContent = 'Preparando a foto…';
   $('ocrBar').style.width = '5%';
-  if (typeof Tesseract === 'undefined') {
+  if (typeof Tesseract === 'undefined' || !Tesseract.createWorker) {
     box.classList.add('hidden');
     saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '');
     return;
   }
-  Tesseract.recognize(dataUrl, 'jpn', {
-    logger: function (m) {
-      if (m.status === 'recognizing text') {
-        $('ocrBar').style.width = Math.round(m.progress * 100) + '%';
-        $('ocrStatus').textContent = 'Lendo a foto… ' + Math.round(m.progress * 100) + '%';
-      } else if (m.status) {
-        $('ocrStatus').textContent = 'Preparando leitura…';
-      }
-    }
-  }).then(function (res) {
+  prepareAndOcr(dataUrl).then(function (text) {
     box.classList.add('hidden');
-    var text = (res && res.data && res.data.text) || '';
     var data = extractFromText(text);
     saveExtractedItem(data, dataUrl, '');
   }).catch(function () {
-    box.classList.add('hidden');
-    saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '');
+    /* Plano B: leitura simples, como era antes da v1.5. */
+    Tesseract.recognize(dataUrl, 'jpn', {
+      logger: function (m) {
+        if (m.status === 'recognizing text') {
+          $('ocrBar').style.width = Math.round(m.progress * 100) + '%';
+          $('ocrStatus').textContent = 'Lendo a foto… ' + Math.round(m.progress * 100) + '%';
+        }
+      }
+    }).then(function (res) {
+      box.classList.add('hidden');
+      var text = (res && res.data && res.data.text) || '';
+      saveExtractedItem(extractFromText(text), dataUrl, '');
+    }).catch(function () {
+      box.classList.add('hidden');
+      saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '');
+    });
   });
 }
 function handlePhotoFile(file) {
