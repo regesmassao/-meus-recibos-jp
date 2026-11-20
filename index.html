@@ -56,7 +56,7 @@
   <section id="view-add" class="view hidden">
     <div class="card">
       <h2>Adicionar papel</h2>
-      <p class="muted">Tire foto de um recibo, conta ou promoção. O app lê, organiza e você confere antes de salvar.</p>
+      <p class="muted">Tire foto de um recibo, conta ou promoção. O app lê e já salva na hora — se algo sair errado, você corrige depois tocando no item.</p>
       <div class="stack">
         <button id="btnCamera" class="primary big" type="button">📷 Tirar foto</button>
         <button id="btnGallery" class="big" type="button">🖼️ Escolher da galeria</button>
@@ -95,6 +95,16 @@
         <div class="field">
           <label for="fAmount">Valor (¥)</label>
           <input id="fAmount" type="number" inputmode="numeric" min="0" step="1" placeholder="0">
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label for="fTendered">Valor pago (¥)</label>
+          <input id="fTendered" type="number" inputmode="numeric" min="0" step="1" placeholder="お預かり">
+        </div>
+        <div class="field">
+          <label for="fChange">Troco (¥)</label>
+          <input id="fChange" type="number" inputmode="numeric" min="0" step="1" placeholder="お釣り">
         </div>
       </div>
       <div class="field" id="wrapCategory">
