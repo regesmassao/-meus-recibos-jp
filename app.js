@@ -1,6 +1,8 @@
-/* Meus Recibos JP — v1
+/* Meus Recibos JP — v1.3
    Tudo fica no aparelho (localStorage, prefixo rec-). Nada é enviado a terceiros.
-   A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn). */
+   A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn).
+   v1.3: extração reforçada (nome fantasia, total/valor pago/troco) e
+   salvamento automático após a leitura — editar virou opcional. */
 'use strict';
 
 /* ============ Constantes ============ */
@@ -70,28 +72,93 @@ function findAllDates(text) {
   return out;
 }
 
-function extractAmount(text) {
-  var total = null;
-  var lines = String(text).split(/\n/);
+/* Normaliza o texto do OCR antes de extrair: converte dígitos/letras/
+   pontuação de largura cheia (１２３，：) para meia largura, ￥ para ¥ e
+   junta espaços que o OCR costuma enfiar no meio dos números
+   ("1, 234" e "1 234" viram "1234"). Idempotente. */
+function normalizeOcr(text) {
+  var t = String(text == null ? '' : text);
+  t = t.replace(/[！-～]/g, function (c) {
+    return String.fromCharCode(c.charCodeAt(0) - 0xFEE0);
+  });
+  t = t.replace(/　/g, ' ');
+  t = t.replace(/￥/g, '¥');
+  t = t.replace(/(\d)\s*,\s*(?=\d)/g, '$1,');
+  var prev = null;
+  while (prev !== t) {
+    prev = t;
+    t = t.replace(/(\d)\s+(\d{3})(?!\d)/g, '$1$2');
+  }
+  return t;
+}
+
+/* Todos os números de uma linha (sem ¥ nem vírgulas). */
+function numbersInLine(line) {
+  var out = [];
+  var re = /[0-9][0-9,]*[0-9]|[0-9]/g, m;
+  while ((m = re.exec(String(line))) !== null) {
+    var v = parseInt(m[0].replace(/,/g, ''), 10);
+    if (!isNaN(v)) out.push(v);
+  }
+  return out;
+}
+
+/* Procura uma palavra-chave (comparando sem espaços, porque o OCR
+   devolve "合 計" / "お 釣 り") e devolve o maior número depois dela na
+   mesma linha; se a linha não tiver número, olha a linha seguinte. */
+function moneyByKeywords(lines, keywords) {
   for (var i = 0; i < lines.length; i++) {
-    if (lines[i].indexOf('合計') >= 0) {
-      var nums = lines[i].match(/[¥￥]?\s*([0-9][0-9,]*)/g) || [];
-      var best = null;
-      nums.forEach(function (s) {
-        var v = parseInt(s.replace(/[¥￥,\s]/g, ''), 10);
-        if (!isNaN(v) && (best === null || v > best)) best = v;
-      });
-      if (best !== null) total = best;
+    var stripped = lines[i].replace(/\s/g, '');
+    for (var k = 0; k < keywords.length; k++) {
+      var pos = stripped.indexOf(keywords[k]);
+      if (pos < 0) continue;
+      var nums = numbersInLine(stripped.slice(pos + keywords[k].length));
+      if (!nums.length) nums = numbersInLine(lines[i]);
+      if (!nums.length && i + 1 < lines.length) nums = numbersInLine(lines[i + 1]);
+      if (nums.length) return Math.max.apply(null, nums);
     }
   }
-  if (total !== null) return total;
-  var max = null;
-  var re = /[¥￥]\s*([0-9][0-9,]*)/g, m;
-  while ((m = re.exec(text)) !== null) {
-    var v = parseInt(m[1].replace(/,/g, ''), 10);
-    if (!isNaN(v) && (max === null || v > max)) max = v;
+  return null;
+}
+
+var TOTAL_KEYWORDS = ['合計金額', '税込合計', 'お買上計', 'お買い上げ',
+  '請求金額', 'お支払金額', 'お支払い金額', '合計'];
+var TENDERED_KEYWORDS = ['お預かり金', 'お預かり', 'お預り', '預り金'];
+var CHANGE_KEYWORDS = ['お釣り', 'おつり', '釣銭', '釣り銭'];
+
+/* Extrai total, valor entregue (お預かり) e troco (お釣り) do texto.
+   tendered/change ficam null quando não aparecem no papel. */
+function extractMoney(rawText) {
+  var text = normalizeOcr(rawText);
+  var lines = text.split(/\n/);
+  var amount = moneyByKeywords(lines, TOTAL_KEYWORDS);
+  if (amount === null) {
+    var maxY = null, m;
+    var reY = /¥\s*([0-9][0-9,]*)/g;
+    while ((m = reY.exec(text)) !== null) {
+      var vy = parseInt(m[1].replace(/,/g, ''), 10);
+      if (!isNaN(vy) && (maxY === null || vy > maxY)) maxY = vy;
+    }
+    amount = maxY;
   }
-  return max;
+  if (amount === null) {
+    var maxE = null;
+    var reE = /([0-9][0-9,]*)\s*円/g;
+    while ((m = reE.exec(text)) !== null) {
+      var ve = parseInt(m[1].replace(/,/g, ''), 10);
+      if (!isNaN(ve) && (maxE === null || ve > maxE)) maxE = ve;
+    }
+    amount = maxE;
+  }
+  return {
+    amount: amount,
+    tendered: moneyByKeywords(lines, TENDERED_KEYWORDS),
+    change: moneyByKeywords(lines, CHANGE_KEYWORDS)
+  };
+}
+
+function extractAmount(text) {
+  return extractMoney(text).amount;
 }
 
 function classifyType(text) {
@@ -113,13 +180,68 @@ function guessCategory(text) {
   return 'Outros';
 }
 
-function extractStore(text) {
-  var lines = String(text).split(/\n/);
-  for (var i = 0; i < lines.length; i++) {
-    var s = lines[i].trim();
-    if (s.length >= 2 && !/^[0-9¥￥%％\s.,:：\/-]+$/.test(s)) return s.slice(0, 60);
+/* Redes conhecidas: [trecho procurado no texto sem espaços, nome exibido].
+   O recibo costuma trazer o nome fantasia em destaque e a razão social
+   (株式会社…) miúda no rodapé — por isso a rede é procurada no texto
+   inteiro antes de olhar linha a linha. */
+var CHAIN_NAMES = [
+  ['セブン-イレブン', 'セブン-イレブン'], ['セブンイレブン', 'セブン-イレブン'],
+  ['ファミリーマート', 'ファミリーマート'], ['ファミマ', 'ファミリーマート'],
+  ['ローソン', 'ローソン'], ['ミニストップ', 'ミニストップ'],
+  ['デイリーヤマザキ', 'デイリーヤマザキ'],
+  ['マイバスケット', 'マイバスケット'], ['まいばすけっと', 'マイバスケット'],
+  ['業務スーパー', '業務スーパー'], ['コストコ', 'コストコ'],
+  ['マルエツ', 'マルエツ'], ['サンワ', 'サンワ'], ['ライフ', 'ライフ'],
+  ['イオン', 'イオン'], ['西友', '西友'], ['オーケー', 'オーケー'],
+  ['ドン・キホーテ', 'ドン・キホーテ'], ['ドンキホーテ', 'ドン・キホーテ'],
+  ['ダイソー', 'ダイソー'], ['セリア', 'セリア'], ['キャンドゥ', 'キャンドゥ'],
+  ['スリーコインズ', '3COINS'], ['3COINS', '3COINS'],
+  ['ブックオフ', 'ブックオフ'], ['ハードオフ', 'ハードオフ'],
+  ['ノジマ', 'ノジマ'], ['ヤマダ電機', 'ヤマダ電機'], ['ケーズデンキ', 'ケーズデンキ'],
+  ['マツモトキヨシ', 'マツモトキヨシ'], ['ウエルシア', 'ウエルシア'],
+  ['サンドラッグ', 'サンドラッグ'], ['クリエイト', 'クリエイト'],
+  ['マクドナルド', 'マクドナルド'], ['モスバーガー', 'モスバーガー'],
+  ['すき家', 'すき家'], ['吉野家', '吉野家'], ['松屋', '松屋'],
+  ['ガスト', 'ガスト'], ['サイゼリヤ', 'サイゼリヤ'],
+  ['スシロー', 'スシロー'], ['くら寿司', 'くら寿司'],
+  ['はま寿司', 'はま寿司'], ['かっぱ寿司', 'かっぱ寿司'],
+  ['日高屋', '日高屋'], ['コメダ珈琲', 'コメダ珈琲'],
+  ['スターバックス', 'スターバックス'], ['ドトール', 'ドトール'],
+  ['タリーズコーヒー', 'タリーズコーヒー'], ['タリーズ', 'タリーズコーヒー']
+];
+
+/* Linhas que nunca são o nome da loja: cabeçalhos de recibo, telefone,
+   endereço postal, datas, linhas só de números e a linha do total. */
+function isJunkStoreLine(s) {
+  if (/領収書|領収証|いらっしゃいませ|ありがとう/.test(s)) return true;
+  if (/TEL|電話|〒|郵便|登録番号/.test(s)) return true;
+  if (/合計|小計/.test(s)) return true;
+  if (/^[0-9¥%.,:：\/\-\s]+$/.test(s)) return true;
+  var flat = s.replace(/\s/g, '');
+  if (/^\d{4}[\/.-]?\d{1,2}[\/.-]?\d{1,2}/.test(flat)) return true;
+  if (/\d{4}年\s*\d{1,2}月\s*\d{1,2}日/.test(s)) return true;
+  return false;
+}
+
+function extractStore(rawText) {
+  var text = normalizeOcr(rawText);
+  var flatAll = text.replace(/\s/g, '');
+  for (var i = 0; i < CHAIN_NAMES.length; i++) {
+    if (flatAll.indexOf(CHAIN_NAMES[i][0].replace(/\s/g, '')) >= 0) return CHAIN_NAMES[i][1];
   }
-  return '';
+  var lines = text.split(/\n/);
+  var legalFallback = '';
+  for (var j = 0; j < Math.min(lines.length, 8); j++) {
+    var s = lines[j].trim();
+    if (s.length < 2 || s.length > 30) continue;
+    if (isJunkStoreLine(s)) continue;
+    if (/株式会社|有限会社|合同会社|（株）|\(株\)/.test(s)) {
+      if (!legalFallback) legalFallback = s;
+      continue;
+    }
+    if (/[ぁ-んァ-ヶ一-龯A-Za-z]/.test(s)) return s;
+  }
+  return legalFallback.slice(0, 60);
 }
 
 /* Procura a data na linha do vencimento (期限/お支払い), comum em contas. */
@@ -135,9 +257,11 @@ function findDueDate(text) {
 }
 
 /* Extrai os campos do formulário a partir do texto lido (OCR ou QR). */
-function extractFromText(text) {
+function extractFromText(rawText) {
+  var text = normalizeOcr(rawText);
   var type = classifyType(text);
   var dates = findAllDates(text);
+  var money = extractMoney(text);
   var due = null, valid = null;
   if (type === 'conta') due = findDueDate(text) || (dates.length > 1 ? dates[dates.length - 1] : null);
   if (type === 'promocao' && dates.length > 1) valid = dates[dates.length - 1];
@@ -145,7 +269,9 @@ function extractFromText(text) {
     type: type,
     date: dates.length ? dates[0] : todayISO(),
     store: extractStore(text),
-    amount: extractAmount(text),
+    amount: money.amount,
+    tendered: money.tendered,
+    change: money.change,
     category: guessCategory(text),
     dueDate: due,
     validUntil: valid
@@ -174,6 +300,8 @@ function sanitizeItem(raw) {
     date: typeof raw.date === 'string' ? raw.date : todayISO(),
     store: String(raw.store || ''),
     amount: Math.max(0, parseInt(raw.amount, 10) || 0),
+    tendered: Math.max(0, parseInt(raw.tendered, 10) || 0),
+    change: Math.max(0, parseInt(raw.change, 10) || 0),
     category: CATEGORIES.indexOf(raw.category) >= 0 ? raw.category : 'Outros',
     dueDate: raw.dueDate || null,
     validUntil: raw.validUntil || null,
@@ -351,6 +479,8 @@ function renderDetail(id) {
     ['Data', fmtDateBR(it.date)],
     ['Valor', it.amount > 0 ? fmtYen(it.amount) : '—']
   ];
+  if (it.tendered > 0) rows.push(['Valor pago', fmtYen(it.tendered)]);
+  if (it.change > 0) rows.push(['Troco', fmtYen(it.change)]);
   if (it.type === 'recibo') rows.push(['Categoria', it.category]);
   if (it.type === 'conta') {
     rows.push(['Vencimento', it.dueDate ? fmtDateBR(it.dueDate) : '—']);
@@ -371,7 +501,7 @@ function renderDetail(id) {
   showView('detail');
 }
 
-/* ============ Revisão (obrigatória antes de salvar) ============ */
+/* ============ Edição (opcional, depois de salvar) ============ */
 var formType = 'recibo';
 function setFormType(t) {
   formType = t;
@@ -393,6 +523,8 @@ function openReview(data, photo, link, editId) {
   $('fStore').value = data.store || '';
   $('fDate').value = data.date || todayISO();
   $('fAmount').value = data.amount != null ? data.amount : '';
+  $('fTendered').value = data.tendered ? data.tendered : '';
+  $('fChange').value = data.change ? data.change : '';
   $('fCategory').value = data.category || 'Outros';
   $('fDue').value = data.dueDate || '';
   $('fValid').value = data.validUntil || '';
@@ -406,12 +538,16 @@ function openReview(data, photo, link, editId) {
 }
 function saveFromForm() {
   var amount = parseInt(String($('fAmount').value).replace(/[^0-9]/g, ''), 10);
+  var tendered = parseInt(String($('fTendered').value).replace(/[^0-9]/g, ''), 10);
+  var change = parseInt(String($('fChange').value).replace(/[^0-9]/g, ''), 10);
   var data = {
     id: editingId || newId(),
     type: formType,
     date: $('fDate').value || todayISO(),
     store: $('fStore').value.trim(),
     amount: isNaN(amount) ? 0 : amount,
+    tendered: isNaN(tendered) ? 0 : tendered,
+    change: isNaN(change) ? 0 : change,
     category: formType === 'recibo' ? $('fCategory').value : 'Outros',
     dueDate: formType === 'conta' && $('fDue').value ? $('fDue').value : null,
     validUntil: formType === 'promocao' && $('fValid').value ? $('fValid').value : null,
@@ -435,6 +571,40 @@ function saveFromForm() {
   viewMonth = { y: +(data.date.slice(0, 4)), m: (+(data.date.slice(5, 7))) - 1 };
   renderHome();
   showView('home');
+}
+
+/* ============ Salvamento automático (foto/QR) ============ */
+/* Fotografou, salvou: o item entra na hora com o que a leitura achou —
+   mesmo que não tenha achado nada (fica a foto e a data de hoje).
+   Conferir e corrigir é opcional, depois, tocando no item no
+   histórico (detalhe → Editar). */
+function saveExtractedItem(data, photo, link) {
+  var item = sanitizeItem({
+    id: newId(),
+    type: data.type || 'recibo',
+    date: data.date || todayISO(),
+    store: data.store || '',
+    amount: data.amount != null ? data.amount : 0,
+    tendered: data.tendered != null ? data.tendered : 0,
+    change: data.change != null ? data.change : 0,
+    category: data.type === 'recibo' ? (data.category || 'Outros') : 'Outros',
+    dueDate: data.dueDate || null,
+    validUntil: data.validUntil || null,
+    paid: false,
+    note: data.note || '',
+    link: link || '',
+    photo: photo || null,
+    createdAt: Date.now()
+  });
+  items.push(item);
+  saveItems(items);
+  viewMonth = { y: +(item.date.slice(0, 4)), m: (+(item.date.slice(5, 7))) - 1 };
+  renderHome();
+  showView('home');
+  var summary = 'Salvo ✔ ' + (item.store || TYPES[item.type]) +
+    (item.amount > 0 ? ' · ' + fmtYen(item.amount) : '');
+  toast(summary + ' — se algo estiver errado, toque no item pra corrigir.');
+  return item;
 }
 
 /* ============ Foto + OCR ============ */
@@ -462,8 +632,7 @@ function runOCR(dataUrl) {
   $('ocrBar').style.width = '5%';
   if (typeof Tesseract === 'undefined') {
     box.classList.add('hidden');
-    toast('Leitura automática indisponível (sem internet?). Preencha manualmente.');
-    openReview({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '', null);
+    saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '');
     return;
   }
   Tesseract.recognize(dataUrl, 'jpn', {
@@ -479,12 +648,10 @@ function runOCR(dataUrl) {
     box.classList.add('hidden');
     var text = (res && res.data && res.data.text) || '';
     var data = extractFromText(text);
-    if (!text.trim()) toast('Não consegui ler o texto. Confira e preencha os campos.');
-    openReview(data, dataUrl, '', null);
+    saveExtractedItem(data, dataUrl, '');
   }).catch(function () {
     box.classList.add('hidden');
-    toast('A leitura falhou. Preencha os campos manualmente.');
-    openReview({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '', null);
+    saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '');
   });
 }
 function handlePhotoFile(file) {
@@ -502,16 +669,14 @@ function stopQR() {
 }
 function handleQRText(text) {
   stopQR();
-  var data = extractFromText(text);
   var isUrl = /^https?:\/\//i.test(text.trim());
   if (isUrl) {
-    data.note = data.note || '';
-    openReview({ type: 'recibo', date: todayISO(), category: 'Outros' }, null, text.trim(), null);
+    saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, null, text.trim());
   } else {
-    openReview(data, null, '', null);
-    if (data.amount == null && !data.store) $('fNote').value = text.slice(0, 300);
+    var data = extractFromText(text);
+    if (data.amount == null && !data.store) data.note = text.slice(0, 300);
+    saveExtractedItem(data, null, '');
   }
-  toast('QR lido ✔ Confira os dados.');
 }
 function startQR() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -856,7 +1021,9 @@ if (typeof document !== 'undefined' && document.getElementById) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     extractFromText: extractFromText, classifyType: classifyType,
-    extractAmount: extractAmount, findAllDates: findAllDates,
+    extractAmount: extractAmount, extractMoney: extractMoney,
+    extractStore: extractStore, normalizeOcr: normalizeOcr,
+    findAllDates: findAllDates,
     fmtYen: fmtYen, fmtDateBR: fmtDateBR, mergeImport: mergeImport,
     sanitizeItem: sanitizeItem, CATEGORIES: CATEGORIES,
     buildBackupPayload: buildBackupPayload
