@@ -71,10 +71,10 @@
 'use strict';
 
 /* ============ Constantes ============ */
-var APP_VERSION = '1.9';
+var APP_VERSION = '1.10';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
-  'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Outros'];
+  'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
 var TYPES = { recibo: 'Recibo', conta: 'Conta', promocao: 'Promoção' };
 var TYPE_ICONS = { recibo: '🧾', conta: '📄', promocao: '🏷️' };
 
@@ -87,7 +87,8 @@ var CATEGORY_HINTS = [
   [/スーパー|イオン|業務スーパー|西友|ライフ|マルエツ|サンワ|コストコ|マイバスケット|オーケー/, 'Supermercado'],
   [/サイゼリヤ|ガスト|マクドナルド|モスバーガー|すき家|吉野家|松屋|日高屋|スシロー|くら寿司|はま寿司|かっぱ寿司|コメダ|スターバックス|ドトール|タリーズ|レストラン|食堂|ラーメン|居酒屋|カフェ/, 'Restaurante'],
   [/ダイソー|セリア|キャンドゥ|3COINS|ブックオフ|ハードオフ|ドン・キホーテ/, 'Compras'],
-  [/電車|バス|タクシー|Suica|PASMO|チャージ/, 'Transporte']
+  [/電車|バス|タクシー|Suica|PASMO|チャージ/, 'Transporte'],
+  [/コインランドリー|ランドリー|クリーニング|Lavanderia/i, 'Lavanderia']
 ];
 
 /* ============ Utilidades puras ============ */
