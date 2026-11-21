@@ -26,6 +26,7 @@ main{max-width:640px; margin:0 auto; padding:14px 12px}
 }
 .card h2{margin:0 0 10px; font-size:16px}
 .muted{color:var(--muted); font-size:13px}
+.app-version{text-align:center; color:var(--muted); font-size:12px; padding:16px 0 28px}
 .mt{margin-top:10px}
 .row{display:flex; align-items:center}
 .row.between{justify-content:space-between}

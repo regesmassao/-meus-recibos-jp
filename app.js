@@ -1,4 +1,4 @@
-/* Meus Recibos JP — v1.7
+/* Meus Recibos JP — v1.8
    Tudo fica no aparelho (localStorage, prefixo rec-). Nada é enviado a terceiros.
    A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn).
    v1.3: extração reforçada (nome fantasia, total/valor pago/troco) e
@@ -36,10 +36,29 @@
    enfiados do OCR do aparelho. E cada item passa a guardar o texto
    bruto do OCR (`ocrText`, seção "Texto lido (OCR)" no detalhe):
    a próxima falha já nasce diagnosticável pelo backup.
-   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.7.md (fora do repo). */
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.7.md (fora do repo).
+   v1.8: duas falhas reais novas, diagnosticadas do ocrText que o
+   aparelho gravou. (1) FamilyMart: a linha do 合計 não sobreviveu e
+   a base saiu "( 8※X 対 象 620)" — sem o prefixo 税率 que o
+   scanTaishou exigia; agora a base "N%対象" vale também com o 税
+   destruído (※) e até com o 対象 destruído, se a linha curta
+   começar pela taxa e trouxer o valor com ¥/\; dígito solto perto
+   do お預り destruído virava "pago ¥9" — entregue/troco < ¥100 sem
+   rótulo+valor limpos na mesma linha não é mais salvo; e redes com
+   nome latino no cabeçalho (FamilyMart, Seven-Eleven, Lawson,
+   Ministop) canonizam pro katakana + categoria. (2) Saizeriya, foto
+   nova e boa: as passadas A–D leram só o topo do recibo (273
+   caracteres, nada da zona de totais) — o pipeline ganhou passadas
+   de RESGATE: sem marcadores de totais no texto, ou sem total
+   extraído, ele relê a zona de totais em outras escalas/PSM e a
+   zona da data antes de salvar. E o rodapé das telas Início e
+   Backup mostra "Meus Recibos JP · versão 1.8" (APP_VERSION —
+   atualizar junto com o CACHE do sw.js a cada release).
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.8.md (fora do repo). */
 'use strict';
 
 /* ============ Constantes ============ */
+var APP_VERSION = '1.8';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Outros'];
@@ -49,7 +68,7 @@ var TYPE_ICONS = { recibo: '🧾', conta: '📄', promocao: '🏷️' };
 var CONTA_KEYWORDS = ['請求', 'お支払い', 'お支払', '払込', '期限', '振込'];
 var PROMO_KEYWORDS = ['OFF', 'セール', 'クーポン', '割引'];
 var CATEGORY_HINTS = [
-  [/セブン|ローソン|ファミリーマート|ミニストップ|コンビニ/, 'Konbini'],
+  [/セブン|ローソン|ファミリーマート|ミニストップ|コンビニ|FamilyMart|Seven[-\s]?Eleven|Lawson|Ministop/i, 'Konbini'],
   [/ドラッグ|薬局|マツモトキヨシ|ウエルシア|スギ薬局/, 'Farmácia'],
   [/病院|クリニック|歯科|眼科/, 'Saúde'],
   [/スーパー|イオン|業務スーパー|西友|ライフ|マルエツ|サンワ|コストコ|マイバスケット|オーケー/, 'Supermercado'],
@@ -117,10 +136,11 @@ function findAllDates(text) {
   return out;
 }
 
-/* Ano a partir de um token "sujo" do OCR: corrige O/C→0 e Z→2, desfaz
-   um dígito duplicado ("20226"→"2026") e exige 2015–2035. */
+/* Ano a partir de um token "sujo" do OCR: corrige O/C/G→0 e Z→2,
+   desfaz um dígito duplicado ("20226"→"2026") e exige 2015–2035.
+   (v1.8: G→0 — a passada de resgate leu "2G26/11720" na Saizeriya.) */
 function yearFromOcrToken(tok) {
-  var d = String(tok).replace(/[OoCc]/g, '0').replace(/[Zz]/g, '2');
+  var d = String(tok).replace(/[OoCcGg]/g, '0').replace(/[Zz]/g, '2');
   if (!/^\d{4,5}$/.test(d)) return null;
   if (d.length === 5) d = d.replace(/(\d)\1/, '$1');
   if (d.length !== 4) return null;
@@ -131,7 +151,7 @@ function yearFromOcrToken(tok) {
 function findTolerantDates(text) {
   var out = [];
   var m;
-  var reA = /([0-9OoCcZz]{4,5})\s*[\/.-]\s*(\d{1,2})\s*[\/.-]\s*(\d{1,2})/g;
+  var reA = /([0-9OoCcGgZz]{4,5})\s*[\/.-]\s*(\d{1,2})\s*[\/.-]\s*(\d{1,2})/g;
   while ((m = reA.exec(text)) !== null) {
     var y = yearFromOcrToken(m[1]);
     if (y === null) continue;
@@ -139,7 +159,7 @@ function findTolerantDates(text) {
     if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) out.push(toISODate(y, mo, da));
   }
   // "/" entre mês e dia lida como "7": "2026/11720" = 2026/11/20
-  var reB = /([0-9OoCcZz]{4,5})\s*[\/.-]\s*(\d{2})[7](\d{2})(?!\d)/g;
+  var reB = /([0-9OoCcGgZz]{4,5})\s*[\/.-]\s*(\d{2})[7](\d{2})(?!\d)/g;
   while ((m = reB.exec(text)) !== null) {
     var y2 = yearFromOcrToken(m[1]);
     if (y2 === null) continue;
@@ -332,20 +352,38 @@ function scanTaxes(lines) {
    duas taxas (8%/10%), a soma das bases é o 合計. É evidência
    impressa e rotulada do total, e no aparelho foi a linha que
    sobreviveu quando a do 合計 não foi lida. Devolve os valores
-   distintos, em ordem de aparição. */
+   distintos, em ordem de aparição.
+   v1.8: o aparelho leu a base do FamilyMart como "( 8※X 対 象 620)"
+   — sem o prefixo 税率 (o "%" virou ※ e sobrou um X): a linha vale
+   se trouxer 税率, um "%", OU a taxa (dígito + %/％/※) antes do
+   対象. E quando até o 対象 é destruído, a linha curta que COMEÇA
+   pela taxa e traz o valor com ¥/\ ("8 % 記 家 \620)") é a mesma
+   linha degradada — vale como candidata, com o valor marcado. */
 function scanTaishou(lines) {
   var byVal = {}, order = [];
+  function push(v) {
+    if (v !== null && v >= 100 && !byVal[v]) { byVal[v] = true; order.push(v); }
+  }
   for (var i = 0; i < lines.length; i++) {
     var raw = lines[i].replace(/\s/g, '');
     if (raw.indexOf('対象') < 0) continue;
-    if (raw.indexOf('税率') < 0 && raw.indexOf('%') < 0) continue;
     var pos = raw.indexOf('対象');
+    var pre = raw.slice(0, pos);
+    if (raw.indexOf('税率') < 0 && raw.indexOf('%') < 0 &&
+        !/\d\s*[%％※]/.test(pre)) continue;
     var nums = numbersInLineFuzzy(stripRates(raw.slice(pos + 2)));
     if (!nums.length) nums = numbersInLineFuzzy(stripRates(raw));
-    for (var j = 0; j < nums.length; j++) {
-      var v = nums[j];
-      if (v >= 100 && !byVal[v]) { byVal[v] = true; order.push(v); }
-    }
+    for (var j = 0; j < nums.length; j++) push(nums[j]);
+  }
+  for (var k = 0; k < lines.length; k++) {
+    var st = lines[k].replace(/\s/g, '');
+    if (st.indexOf('対象') >= 0) continue;
+    if (!/^\(?\d{1,2}\s*[%％※]/.test(st)) continue;
+    if (st.length > 16) continue;
+    if (/小計|合計|消費税|値引|割引/.test(st)) continue;
+    var vm = /[¥\\]\s*([0-9][0-9,.]*)/.exec(st);
+    if (!vm) continue;
+    push(parseNumToken(vm[1]));
   }
   return order;
 }
@@ -391,6 +429,24 @@ function labelConcatCandidates(lines, tOut, cOut) {
       if (vc !== null && cOut.indexOf(vc) < 0) cOut.push(vc);
     }
   }
+}
+
+/* Evidência forte de um valor pequeno (< ¥100) de entregue/troco:
+   a linha tem o rótulo e, depois dele, SÓ o valor (com ¥/円 no
+   máximo) — "お釣り ¥45" limpo. Se depois do rótulo tem lixo junto
+   ("お預り ーー り 9. ログ 2"), o dígito é fragmento, não dinheiro:
+   foi assim que o aparelho salvou "pago ¥9" no FamilyMart (v1.8). */
+function strongLabelValue(lines, keywords, v) {
+  for (var i = 0; i < lines.length; i++) {
+    var st = lines[i].replace(/\s/g, '');
+    for (var k = 0; k < keywords.length; k++) {
+      var pos = st.indexOf(keywords[k]);
+      if (pos < 0) continue;
+      var rest = st.slice(pos + keywords[k].length).replace(/[¥￥\\円]/g, '');
+      if (/^\d+$/.test(rest) && parseInt(rest, 10) === v) return true;
+    }
+  }
+  return false;
 }
 
 /* Extrai total, valor entregue (お預かり) e troco (お釣り) do texto.
@@ -488,6 +544,13 @@ function extractMoney(rawText) {
 
   var tenderedKw = moneyByKeywords(lines, TENDERED_KEYWORDS);
   var changeKw = moneyByKeywords(lines, CHANGE_KEYWORDS);
+  /* v1.8: guarda anti-lixo — entregue/troco < ¥100 vindo de linha
+     com o rótulo destruído é fragmento (o "9" do FamilyMart), não
+     dinheiro. Só sobrevive com rótulo+valor limpos na mesma linha. */
+  if (tenderedKw !== null && tenderedKw > 0 && tenderedKw < 100 &&
+      !strongLabelValue(lines, TENDERED_KEYWORDS, tenderedKw)) tenderedKw = null;
+  if (changeKw !== null && changeKw > 0 && changeKw < 100 &&
+      !strongLabelValue(lines, CHANGE_KEYWORDS, changeKw)) changeKw = null;
   var ojiri = ojiriLines(lines);
   var concatT = [], concatC = [];
   labelConcatCandidates(lines, concatT, concatC);
@@ -530,6 +593,29 @@ function extractMoney(rawText) {
     ojiriConcat.forEach(function (v) {
       if (v >= amount && (tendered === null || v < tendered)) tendered = v;
     });
+    /* v1.8: par redondo — com os rótulos お預り/お釣り destruídos
+       (a Saizeriya refeita só leu "{2 3,000 計" na zona de
+       pagamento), o entregue pode ser um valor REDONDO (múltiplo de
+       ¥100) maior que o total cujo troco (ele − total) TAMBÉM está
+       impresso no papel: os dois valores impressos fecham a conta
+       um do outro, como a soma 小計+消費税 da v1.6. Sem o par, não
+       entra — número solto maior que o total pode ser telefone,
+       registro, qualquer coisa. */
+    if (tendered === null) {
+      var allNumsR = collectAllNumbers(lines);
+      var roundCands = [];
+      for (var rk in allNumsR) {
+        var rv = +rk;
+        if (rv > amount && rv <= amount + 10000 && rv % 100 === 0 &&
+            allNumsR[rv - amount]) roundCands.push(rv);
+      }
+      if (roundCands.length) {
+        tendered = Math.min.apply(null, roundCands);
+        var rDiff = tendered - amount;
+        if (rDiff > 0 && cCands.indexOf(rDiff) < 0) cCands.push(rDiff);
+        hasChangeLine = true;
+      }
+    }
     concatC.forEach(function (v) {
       if (v > 0 && v < amount && cCands.indexOf(v) < 0) cCands.push(v);
     });
@@ -561,6 +647,13 @@ function extractMoney(rawText) {
      plausível (troco menor que o total). */
   var expected = (tendered !== null && amount !== null && tendered >= amount)
     ? tendered - amount : null;
+  /* v1.8: candidato de troco < ¥100 só vale se for o troco exato da
+     conta (expected) ou tiver rótulo+valor limpos — fragmento solto
+     de linha お?り (o "10" de um ¥10.020 destruído) não é troco. */
+  cCands = cCands.filter(function (v) {
+    return v >= 100 || v === expected ||
+      strongLabelValue(lines, CHANGE_KEYWORDS, v);
+  });
   var change = null;
   if (expected !== null && expected === 0) change = 0;
   else if (expected !== null && cCands.indexOf(expected) >= 0) change = expected;
@@ -587,8 +680,11 @@ function classifyType(text) {
     /* Recibo de restaurante/supermercado traz "10%対象計" — o "%"
        sozinho não faz dele promoção; só vira promoção se o papel não
        tiver cara de recibo. Os marcadores são testados SEM espaços:
-       o OCR do aparelho devolve "小 計" e a v1.6 marcava promoção. */
-    if (!/合計|小計|領収|お預|お釣|釣銭/.test(t.replace(/\s/g, ''))) return 'promocao';
+       o OCR do aparelho devolve "小 計" e a v1.6 marcava promoção.
+       v1.8: 消費税/税率/登録番号 também são cara de recibo — nas
+       passadas de resgate da Saizeriya só o rodapé "軽減税率対象品目"
+       sobreviveu, e o texto virava "promocao" sem eles. */
+    if (!/合計|小計|領収|お預|お釣|釣銭|消費税|税率|登録番号/.test(t.replace(/\s/g, ''))) return 'promocao';
   }
   return 'recibo';
 }
@@ -619,6 +715,13 @@ function guessCategory(text) {
 function chainHit(text, needle) {
   var n1 = String(needle).replace(/\s/g, '');
   if (String(text).replace(/\s/g, '').indexOf(n1) >= 0) return true;
+  /* Nome latino (v1.8): o cabeçalho pode trazer "FamilyMart" em
+     letras latinas, com a capitalização que o OCR enxergou —
+     compara sem caixa nos dois lados. */
+  if (/[A-Za-z]/.test(n1)) {
+    if (String(text).replace(/\s/g, '').toLowerCase()
+        .indexOf(n1.toLowerCase()) >= 0) return true;
+  }
   var n2 = n1.replace(/[^ぁ-んァ-ヶー一-龯A-Za-z0-9]/g, '');
   var clean = String(text).replace(/[^ぁ-んァ-ヶー一-龯A-Za-z0-9]/g, '');
   if (n2.length >= 2 && clean.indexOf(n2) >= 0) return true;
@@ -673,8 +776,11 @@ function kanaSkeleton(s) {
    inteiro antes de olhar linha a linha. */
 var CHAIN_NAMES = [
   ['セブン-イレブン', 'セブン-イレブン'], ['セブンイレブン', 'セブン-イレブン'],
+  ['Seven-Eleven', 'セブン-イレブン'], ['SevenEleven', 'セブン-イレブン'],
   ['ファミリーマート', 'ファミリーマート'], ['ファミマ', 'ファミリーマート'],
-  ['ローソン', 'ローソン'], ['ミニストップ', 'ミニストップ'],
+  ['FamilyMart', 'ファミリーマート'],
+  ['ローソン', 'ローソン'], ['Lawson', 'ローソン'],
+  ['ミニストップ', 'ミニストップ'], ['Ministop', 'ミニストップ'],
   ['デイリーヤマザキ', 'デイリーヤマザキ'],
   ['マイバスケット', 'マイバスケット'], ['まいばすけっと', 'マイバスケット'],
   ['業務スーパー', '業務スーパー'], ['コストコ', 'コストコ'],
@@ -1767,9 +1873,46 @@ function ocrPasses(variants, onPass) {
   });
 }
 
+/* Marcadores da zona de totais: se nenhum aparece no texto
+   combinado, as passadas não leram a metade de baixo do recibo. */
+function hasTotalsMarkers(text) {
+  return /合計|小計|対象|預|釣|税/.test(String(text || '').replace(/\s/g, ''));
+}
+
+/* Passadas de RESGATE (v1.8): a foto nova da Saizeriya — reta, bem
+   iluminada — rendeu só 273 caracteres nas passadas A–D: a zona de
+   totais não foi lida em nenhuma escala/PSM delas. O resgate relê
+   a zona de totais em outras combinações (PSM 6 lê o bloco térmico
+   denso melhor que o PSM 4 em vários motores; 1100px às vezes vence
+   2200px) e a zona da data (a linha do TEL/data fica no meio do
+   recibo, fora dos recortes de totais). Só roda quando precisa:
+   sem marcador de totais no texto OU sem total extraído — marcador
+   sozinho não basta, porque o rodapé "軽減税率対象品目" carrega
+   税/対象 sem a zona de totais ter sido lida. */
+function rescueVariants(img, boxes) {
+  var full = { x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight };
+  var tight = boxes ? boxes.tight : full;
+  function zone(y0, y1) {
+    return {
+      x: tight.x, y: Math.round(tight.y + tight.h * y0),
+      w: tight.w, h: Math.round(tight.h * (y1 - y0))
+    };
+  }
+  var totals = zone(0.53, 1);
+  return [
+    { img: makeOcrVariant(img, totals, 1500), psm: '6' },
+    { img: makeOcrVariant(img, totals, 2200), psm: '4' },
+    { img: makeOcrVariant(img, totals, 2200), psm: '6' },
+    { img: makeOcrVariant(img, totals, 1100), psm: '6' },
+    { img: makeOcrVariant(img, zone(0.12, 0.52), 2000), psm: '6' }
+  ];
+}
+
 /* Pipeline completo: prepara as variantes e lê. Se o telefone não
    sair nas passadas PSM 4, tenta uma passada extra em PSM automático
-   na variante folgada (ela lê melhor a linha do TEL). */
+   na variante folgada (ela lê melhor a linha do TEL). Se a zona de
+   totais não tiver sido lida (ou o total não tiver saído), roda as
+   passadas de resgate antes de devolver o texto. */
 function prepareAndOcr(dataUrl) {
   return loadImageEl(dataUrl).then(function (img) {
     var boxes = detectPaperBoxes(img);
@@ -1797,6 +1940,14 @@ function prepareAndOcr(dataUrl) {
       if (extractPhone(merged)) return merged;
       var extra = [{ img: makeOcrVariant(img, wide, 1100), psm: '3' }];
       return ocrPasses(extra, null).then(function (t) {
+        return merged + '\n' + t;
+      }, function () { return merged; });
+    }).then(function (merged) {
+      if (hasTotalsMarkers(merged) && extractMoney(merged).amount !== null) {
+        return merged;
+      }
+      $('ocrStatus').textContent = 'Lendo a foto… parte extra (totais)';
+      return ocrPasses(rescueVariants(img, boxes), null).then(function (t) {
         return merged + '\n' + t;
       }, function () { return merged; });
     });
@@ -2214,6 +2365,35 @@ function bindEvents() {
   $('driveNoticeClose').onclick = driveHideNotice;
 }
 
+/* Rodapé de versão (v1.8): "Meus Recibos JP · versão X.Y" no fim
+   das telas Início e Backup — é assim que o usuário confirma que a
+   atualização chegou (nos outros apps ele confere a versão em
+   Ajustes). A fonte única é APP_VERSION. O texto é preenchido pelo
+   JS e, se o HTML em cache for antigo e não tiver o elemento, ele
+   é criado aqui — a linha aparece mesmo com HTML velho. */
+function renderVersionFooter(doc) {
+  var d = doc || (typeof document !== 'undefined' ? document : null);
+  if (!d || !d.getElementById || !d.createElement) return '';
+  var text = 'Meus Recibos JP · versão ' + APP_VERSION;
+  var views = ['view-home', 'view-backup'];
+  for (var i = 0; i < views.length; i++) {
+    var view = d.getElementById(views[i]);
+    if (!view || !view.appendChild) continue;
+    var found = null;
+    if (view.querySelectorAll) {
+      var kids = view.querySelectorAll('.app-version');
+      if (kids && kids.length) found = kids[0];
+    }
+    if (!found) {
+      found = d.createElement('div');
+      found.className = 'app-version';
+      view.appendChild(found);
+    }
+    found.textContent = text;
+  }
+  return text;
+}
+
 function init() {
   var rawItems = loadItems();
   var needsMigration = rawItems.some(function (r) {
@@ -2225,6 +2405,7 @@ function init() {
   viewMonth = { y: now.getFullYear(), m: now.getMonth() };
   fillSelects();
   bindEvents();
+  renderVersionFooter();
   $('driveUrl').value = localStorage.getItem('rec-driveUrl') || '';
   $('driveKey').value = localStorage.getItem('rec-driveKey') || '';
   driveRenderSync();
@@ -2255,6 +2436,8 @@ if (typeof module !== 'undefined' && module.exports) {
     findAllDates: findAllDates,
     fmtYen: fmtYen, fmtDateBR: fmtDateBR, mergeImport: mergeImport,
     sanitizeItem: sanitizeItem, CATEGORIES: CATEGORIES,
-    buildBackupPayload: buildBackupPayload
+    buildBackupPayload: buildBackupPayload,
+    APP_VERSION: APP_VERSION, renderVersionFooter: renderVersionFooter,
+    hasTotalsMarkers: hasTotalsMarkers
   };
 }
