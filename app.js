@@ -1,4 +1,4 @@
-/* Meus Recibos JP — v1.8
+/* Meus Recibos JP — v1.9
    Tudo fica no aparelho (localStorage, prefixo rec-). Nada é enviado a terceiros.
    A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn).
    v1.3: extração reforçada (nome fantasia, total/valor pago/troco) e
@@ -54,11 +54,24 @@
    zona da data antes de salvar. E o rodapé das telas Início e
    Backup mostra "Meus Recibos JP · versão 1.8" (APP_VERSION —
    atualizar junto com o CACHE do sw.js a cada release).
-   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.8.md (fora do repo). */
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.8.md (fora do repo).
+   v1.9: UMA regra nova de extração — o fechamento pela zona de
+   pagamento (paymentZoneClose). No reteste real da v1.8, a Saizeriya
+   (foto 2) salvou data e troco certos, mas total e pago zerados: no
+   ocrText do aparelho o ¥2.900 aparece 4+ vezes na zona de totais
+   sem NUNCA colar num 合計/小計 legível, e o ¥3.000 aparece limpo
+   uma vez, numa linha "頂り" (o 預 lido como 頂). Quando nenhum
+   caminho acha o total mas o troco C saiu ancorado (> 0), a regra
+   procura um pago T impresso em linha com cara de pago (redondo,
+   > C) tal que V = T − C apareça ≥ 2 vezes na zona de totais
+   (contando as leituras degradadas: "Z,900", ",900)") ou 1 vez
+   limpo com ¥/\ — a aritmética só desempata entre valores
+   PRESENTES no papel; T nunca nasce de soma. Sem isso, nada muda.
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.9.md (fora do repo). */
 'use strict';
 
 /* ============ Constantes ============ */
-var APP_VERSION = '1.8';
+var APP_VERSION = '1.9';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Outros'];
@@ -449,6 +462,90 @@ function strongLabelValue(lines, keywords, v) {
   return false;
 }
 
+/* v1.9: conta as ocorrências de um valor V no texto, incluindo as
+   leituras degradadas equivalentes: o token fuzzy com Z→2 ("Z,900"
+   e "%Z.900" são o 2900 — o Z já é corrigido pra 2 nas datas) e o
+   fragmento de cauda ",900"/".900" (o dígito da frente destruído:
+   a cauda é só CONSISTENTE com a do valor procurado — dígito
+   nenhum é inventado, porque o V inteiro vem da aritmética de quem
+   chama). cleanMarked conta as ocorrências como token completo
+   com ¥ ou \ colado antes: a forma "limpa e marcada" do impresso. */
+function countValueOccurrences(lines, v) {
+  var count = 0, cleanMarked = 0;
+  var tail = v >= 1000 ? ('00' + (v % 1000)).slice(-3) : null;
+  for (var i = 0; i < lines.length; i++) {
+    var s = String(lines[i]);
+    var re = /[0-9ZzOoUuIl][0-9ZzOoUuIl,.]*/g, m;
+    while ((m = re.exec(s)) !== null) {
+      var tok = m[0];
+      if (!/[0-9]/.test(tok) && tok.length < 3) continue;
+      var mapped = tok.replace(/[OoUu]/g, '0').replace(/[Il]/g, '1')
+        .replace(/[Zz]/g, '2');
+      if (parseNumToken(mapped) !== v) continue;
+      count++;
+      if (/[¥\\]$/.test(s.slice(0, m.index).replace(/\s/g, ''))) cleanMarked++;
+    }
+    if (tail) {
+      var reT = /(^|[^0-9ZzOoUuIl,.])[.,](\d{3})(?!\d)/g, m2;
+      while ((m2 = reT.exec(s)) !== null) {
+        if (m2[2] === tail) count++;
+      }
+    }
+  }
+  return { count: count, cleanMarked: cleanMarked };
+}
+
+/* v1.9: valores em linhas com "cara de pago" — o rótulo お預り sai
+   destruído de várias formas (お移り, 上頂り…), mas a linha guarda
+   um kanji da família 預/頂/移/交 seguido de り, ou a forma お?り
+   das linhas de entregue/troco. É o ÚNICO lugar onde um candidato
+   a "pago" pode nascer pro fechamento da zona de pagamento: fora
+   daí, número redondo solto no texto não é evidência de pagamento. */
+function paymentLineValues(lines) {
+  var out = [];
+  for (var i = 0; i < lines.length; i++) {
+    var st = lines[i].replace(/\s/g, '');
+    if (!(/[預頂移交]り/.test(st) || /^お.り/.test(st) ||
+          st.indexOf('預') >= 0)) continue;
+    numbersInLineFuzzy(lines[i]).forEach(function (v) {
+      if (out.indexOf(v) < 0) out.push(v);
+    });
+  }
+  return out;
+}
+
+/* v1.9: fechamento pela zona de pagamento. Só é chamado quando
+   NENHUM caminho achou o total, mas o troco C saiu ancorado (> 0).
+   A conta fecha com três evidências impressas ao mesmo tempo:
+   (1) um candidato a pago T em linha com cara de pago, redondo
+   (múltiplo de ¥100), maior que o troco e — se um entregue já foi
+   lido por outro caminho — igual a ele (a regra não contradiz
+   leitura ancorada); (2) V = T − C ≥ ¥100 e diferente de qualquer
+   imposto lido no texto; (3) V aparece na zona de totais ≥ 2 vezes
+   (contando as leituras degradadas equivalentes) ou 1 vez como
+   valor limpo marcado com ¥/\. A aritmética só desempata entre
+   candidatos PRESENTES no papel — T nunca nasce de soma. Se mais
+   de um V distinto fechar, é ambíguo: não chuta (devolve null). */
+function paymentZoneClose(lines, change, knownTendered) {
+  var taxes = scanTaxes(lines);
+  var taxSet = {};
+  taxes.loose.concat(taxes.inner).forEach(function (v) { taxSet[v] = true; });
+  var cands = paymentLineValues(lines);
+  var found = {};
+  for (var i = 0; i < cands.length; i++) {
+    var t = cands[i];
+    if (t <= change || t % 100 !== 0 || t > 100000) continue;
+    if (knownTendered !== null && t !== knownTendered) continue;
+    var v = t - change;
+    if (v < 100 || taxSet[v]) continue;
+    var occ = countValueOccurrences(lines, v);
+    if (occ.count >= 2 || occ.cleanMarked >= 1) found[v] = t;
+  }
+  var vs = Object.keys(found);
+  if (vs.length !== 1) return null;
+  return { amount: +vs[0], tendered: found[vs[0]] };
+}
+
 /* Extrai total, valor entregue (お預かり) e troco (お釣り) do texto.
    tendered/change ficam null quando não aparecem no papel.
    v1.5: total também via 小計 e, em último caso, via um 計 solto;
@@ -660,6 +757,17 @@ function extractMoney(rawText) {
   else if (cCands.length === 1) change = cCands[0];
   else if (expected !== null && hasChangeLine && expected < amount && expected <= 5000) change = expected;
   else if (cCands.length) change = cCands[0];
+
+  /* v1.9: sem total por nenhum caminho, mas com o troco ancorado,
+     a zona de pagamento pode fechar a conta (paymentZoneClose) —
+     foi o caso da Saizeriya no aparelho: 合計 e お預り ilegíveis
+     como rótulo, mas o troco ¥100 ancorado na linha "お移り", o
+     pago ¥3.000 impresso na linha "頂り" e o ¥2.900 repetido na
+     zona de totais (3.000 − 100 = 2.900, os três no papel). */
+  if (amount === null && change !== null && change > 0) {
+    var pz = paymentZoneClose(lines, change, tendered);
+    if (pz) { amount = pz.amount; tendered = pz.tendered; }
+  }
 
   return { amount: amount, tendered: tendered, change: change };
 }
