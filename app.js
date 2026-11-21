@@ -1,4 +1,4 @@
-/* Meus Recibos JP — v1.6
+/* Meus Recibos JP — v1.7
    Tudo fica no aparelho (localStorage, prefixo rec-). Nada é enviado a terceiros.
    A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn).
    v1.3: extração reforçada (nome fantasia, total/valor pago/troco) e
@@ -22,7 +22,21 @@
    valor picado do rodapé ("1. 06 ら 0") recompõe o お預り; e cada
    item guarda `photoAt` (data da foto, via EXIF) separado da data
    do recibo — quem manda em totais/histórico/Lugares é a do recibo.
-   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.6.md (fora do repo). */
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.6.md (fora do repo).
+   v1.7: a v1.6 passou no harness (OCR reproduzido via PIL), mas no
+   iPhone o mesmo recibo do Seven salvou ¥982 de novo — cada motor de
+   desenho (PIL/Skia/Safari) entrega um texto OCR diferente, e no do
+   aparelho a evidência do imposto não sobreviveu nas formas que a
+   extração conhecia. Correções: a linha do imposto vale também na
+   forma degradada "(内費科等 8% ¥78)" (sem o 消費税 legível); a base
+   "（税率N%対象 ¥X)" entra como evidência impressa do total; o
+   お預り picado é recomposto também das linhas "お?り" (rótulo com o
+   kanji trocado); 小計（税抜）sem imposto lido NÃO é mais salvo como
+   total (era o 982); tipo/categoria/loja toleram os espaços e kana
+   enfiados do OCR do aparelho. E cada item passa a guardar o texto
+   bruto do OCR (`ocrText`, seção "Texto lido (OCR)" no detalhe):
+   a próxima falha já nasce diagnosticável pelo backup.
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.7.md (fora do repo). */
 'use strict';
 
 /* ============ Constantes ============ */
@@ -282,21 +296,58 @@ function scanSubtotals(lines) {
 
 /* Observações de 消費税: separa a linha "solta" (a que é SOMADA ao
    小計（税抜）pra formar o total) da linha "（内…）" (que só informa
-   quanto de imposto já está incluso num total 税込）. */
+   quanto de imposto já está incluso num total 税込）.
+   v1.7: a linha interna vale também na forma degradada que o OCR do
+   aparelho entrega — "(内費科等 8% ¥78)", sem o 消費税 legível (o 消
+   some e o 税 vira 科）: 内…等 com % e valor é a linha do imposto. */
 function scanTaxes(lines) {
   var loose = [], inner = [];
   for (var i = 0; i < lines.length; i++) {
     var st = lines[i].replace(/\s/g, '');
     var pos = st.indexOf('消費税');
-    if (pos < 0) continue;
-    var nums = numbersInLineFuzzy(stripRates(st.slice(pos + 3)));
+    var degradedInner = pos < 0 && /^\(?内.*等/.test(st) && st.indexOf('%') >= 0;
+    if (pos < 0 && !degradedInner) continue;
+    /* Fragmento de linha (ex.: "(内消費税等 8 え" — sobrou o dígito
+       da TAXA, sem % nem ¥) não é linha de dinheiro: sem nenhum
+       símbolo de valor, o número é ruído, não o imposto. */
+    if (st.indexOf('%') < 0 && st.indexOf('¥') < 0 && st.indexOf('￥') < 0 &&
+        st.indexOf('\\') < 0 && st.indexOf('円') < 0) continue;
+    var nums = numbersInLineFuzzy(stripRates(pos >= 0 ? st.slice(pos + 3) : st));
     if (!nums.length) nums = numbersInLineFuzzy(stripRates(lines[i]));
-    if (!nums.length && i + 1 < lines.length) nums = numbersInLineFuzzy(stripRates(lines[i + 1]));
+    /* v1.7: NADA de procurar o valor na linha seguinte — nas
+       leituras degradadas, a linha seguinte à do imposto é a do
+       合計 destruída ou a do お預り, e os fragmentos dela ("1. 06")
+       viravam um "imposto" de ¥1/¥6 que fechava um total errado
+       (982 + 1 = 983). Linha de imposto de verdade traz o valor
+       nela mesma, em todos os recibos observados. */
     if (!nums.length) continue;
     var v = Math.max.apply(null, nums);
-    if (st.indexOf('内消費税') >= 0) inner.push(v); else loose.push(v);
+    if (degradedInner || st.indexOf('内消費税') >= 0) inner.push(v); else loose.push(v);
   }
   return { loose: loose, inner: inner };
+}
+
+/* Linhas "（税率N%対象 ¥X)": o valor é a base COM imposto daquela
+   taxa — em recibo de taxa única, é o próprio 合計 impresso; com
+   duas taxas (8%/10%), a soma das bases é o 合計. É evidência
+   impressa e rotulada do total, e no aparelho foi a linha que
+   sobreviveu quando a do 合計 não foi lida. Devolve os valores
+   distintos, em ordem de aparição. */
+function scanTaishou(lines) {
+  var byVal = {}, order = [];
+  for (var i = 0; i < lines.length; i++) {
+    var raw = lines[i].replace(/\s/g, '');
+    if (raw.indexOf('対象') < 0) continue;
+    if (raw.indexOf('税率') < 0 && raw.indexOf('%') < 0) continue;
+    var pos = raw.indexOf('対象');
+    var nums = numbersInLineFuzzy(stripRates(raw.slice(pos + 2)));
+    if (!nums.length) nums = numbersInLineFuzzy(stripRates(raw));
+    for (var j = 0; j < nums.length; j++) {
+      var v = nums[j];
+      if (v >= 100 && !byVal[v]) { byVal[v] = true; order.push(v); }
+    }
+  }
+  return order;
 }
 
 /* Todos os números "de dinheiro" do texto (sem taxas), como conjunto
@@ -349,36 +400,60 @@ function labelConcatCandidates(lines, tOut, cOut) {
    tendered − total = troco quando as evidências concordam.
    v1.6: fidelidade ao recibo — o 合計 impresso manda; 小計（税抜）
    nunca é o total (com 消費税 lido, o total é a soma dos dois
-   componentes impressos); 小計 税込/sem qualificador já é o total. */
+   componentes impressos); 小計 税込/sem qualificador já é o total.
+   v1.7: sem o imposto lido, a base "（税率N%対象 ¥X)" — impressa e
+   rotulada — fecha o total do recibo 税抜 (conferida contra o
+   subtotal: tem que excedê-lo por no máximo o imposto de ~10%);
+   e 小計（税抜）sozinho NÃO vira mais o total: foi assim que o
+   aparelho salvou ¥982 sem imposto na v1.6. Sem evidência do total,
+   amount fica null (salva 0, editável) — número errado é pior. */
 function extractMoney(rawText) {
   var text = normalizeOcr(rawText);
   var lines = text.split(/\n/);
   var amount = moneyByKeywords(lines, TOTAL_KEYWORDS);
+  var sub = null;
   if (amount === null) {
-    var sub = scanSubtotals(lines);
-    if (sub) {
-      if (!sub.taxExcluded) {
-        amount = sub.value;
-      } else {
-        /* 小計（税抜）+ 消費税： o total é a soma dos dois valores
-           impressos. Entre os candidatos de imposto, prefere o que
-           faz a soma aparecer impressa em outra linha do papel. */
-        var taxes = scanTaxes(lines);
-        var taxCands = [];
-        taxes.loose.concat(taxes.inner).forEach(function (v) {
-          if (taxCands.indexOf(v) < 0) taxCands.push(v);
-        });
-        if (taxCands.length) {
-          var allNums = collectAllNumbers(lines);
-          var chosenTax = null;
-          for (var ti = 0; ti < taxCands.length; ti++) {
-            if (allNums[sub.value + taxCands[ti]]) { chosenTax = taxCands[ti]; break; }
-          }
-          if (chosenTax === null) chosenTax = taxCands[0];
-          amount = sub.value + chosenTax;
-        } else {
-          amount = sub.value;
+    sub = scanSubtotals(lines);
+    if (sub && !sub.taxExcluded) {
+      amount = sub.value;
+    } else if (sub && sub.taxExcluded) {
+      /* 小計（税抜）+ 消費税： o total é a soma dos dois valores
+         impressos. Entre os candidatos de imposto, prefere o que
+         faz a soma aparecer impressa em outra linha do papel. */
+      var taxes = scanTaxes(lines);
+      var taxCands = [];
+      taxes.loose.concat(taxes.inner).forEach(function (v) {
+        if (taxCands.indexOf(v) < 0) taxCands.push(v);
+      });
+      if (taxCands.length) {
+        var allNums = collectAllNumbers(lines);
+        var chosenTax = null;
+        for (var ti = 0; ti < taxCands.length; ti++) {
+          if (allNums[sub.value + taxCands[ti]]) { chosenTax = taxCands[ti]; break; }
         }
+        if (chosenTax === null) chosenTax = taxCands[0];
+        amount = sub.value + chosenTax;
+      } else {
+        /* Imposto não lido: a base 対象 (com imposto) fecha o
+           total se exceder o subtotal por no máximo ~10% + 1. */
+        var tsh0 = scanTaishou(lines);
+        if (tsh0.length) {
+          var tsum0 = tsh0.reduce(function (s2, v2) { return s2 + v2; }, 0);
+          if (tsum0 > sub.value && tsum0 <= Math.round(sub.value * 1.11) + 1) {
+            amount = tsum0;
+          }
+        }
+      }
+    }
+  }
+  if (amount === null) {
+    /* Sem subtotal aproveitável: a soma das bases 対象 é o total
+       (taxa única: a própria base; duas taxas: a soma delas). */
+    var tsh = scanTaishou(lines);
+    if (tsh.length) {
+      var tsum = tsh.reduce(function (s3, v3) { return s3 + v3; }, 0);
+      if (tsum >= 100 && (!sub || !sub.taxExcluded || tsum > sub.value)) {
+        amount = tsum;
       }
     }
   }
@@ -416,6 +491,17 @@ function extractMoney(rawText) {
   var ojiri = ojiriLines(lines);
   var concatT = [], concatC = [];
   labelConcatCandidates(lines, concatT, concatC);
+  /* v1.7: o valor picado também é recomposto das linhas "お?り"
+     quando o kanji do rótulo foi trocado (お上り por お預り — o
+     labelConcatCandidates só enxerga 預/釣 legíveis). O candidato
+     só é usado como entregue se cobrir o total, então uma linha de
+     troco lida no lugar não contamina. */
+  var ojiriConcat = [];
+  ojiri.forEach(function (o) {
+    var st = lines[o.idx].replace(/\s/g, '');
+    var v = digitConcatValue(st.slice(3));
+    if (v !== null && ojiriConcat.indexOf(v) < 0) ojiriConcat.push(v);
+  });
 
   /* Valor entregue e troco: as linhas お?り das várias passadas se
      misturam (cada passada traz o seu par お預り/お釣り). Com o total
@@ -441,6 +527,9 @@ function extractMoney(rawText) {
     concatT.forEach(function (v) {
       if (v >= amount && (tendered === null || v < tendered)) tendered = v;
     });
+    ojiriConcat.forEach(function (v) {
+      if (v >= amount && (tendered === null || v < tendered)) tendered = v;
+    });
     concatC.forEach(function (v) {
       if (v > 0 && v < amount && cCands.indexOf(v) < 0) cCands.push(v);
     });
@@ -451,7 +540,10 @@ function extractMoney(rawText) {
   } else {
     if (tenderedKw !== null) tendered = tenderedKw;
     else if (ojiri.length && ojiri[0].nums.length) {
-      tendered = Math.max.apply(null, ojiri[0].nums);
+      /* Sem total conhecido, só valores plausíveis de entregue
+         (≥ ¥100): dígito solto de linha "お?り" não é dinheiro. */
+      var bigNums = ojiri[0].nums.filter(function (v) { return v >= 100; });
+      if (bigNums.length) tendered = Math.max.apply(null, bigNums);
     }
     if (changeKw !== null) cCands.push(changeKw);
     for (var o = 1; o < ojiri.length; o++) {
@@ -494,8 +586,9 @@ function classifyType(text) {
   if (t.indexOf('%') >= 0 || t.indexOf('％') >= 0) {
     /* Recibo de restaurante/supermercado traz "10%対象計" — o "%"
        sozinho não faz dele promoção; só vira promoção se o papel não
-       tiver cara de recibo. */
-    if (!/合計|小計|領収|お預|お釣|釣銭/.test(t)) return 'promocao';
+       tiver cara de recibo. Os marcadores são testados SEM espaços:
+       o OCR do aparelho devolve "小 計" e a v1.6 marcava promoção. */
+    if (!/合計|小計|領収|お預|お釣|釣銭/.test(t.replace(/\s/g, ''))) return 'promocao';
   }
   return 'recibo';
 }
@@ -503,13 +596,17 @@ function classifyType(text) {
 function guessCategory(text) {
   /* O OCR enfia espaços e até dígitos no meio dos nomes ("サイ ゼ リ
      ヤ", "サイ1ゼリヤ") — testa o texto cru, sem espaços, sem
-     símbolos e, por fim, só kana/kanji. */
+     símbolos e, por fim, só kana/kanji. A prioridade é da DICA (a
+     identidade da rede — セブン, サイゼリヤ…) sobre a variante: uma
+     palavra genérica ("カフェ") lida no texto cru cheio de ruído não
+     pode vencer o nome da rede que só aparece numa variante limpa
+     (era o que fazia o Seven virar "Restaurante" no OCR do aparelho). */
   var raw = String(text || '');
   var variants = [raw, raw.replace(/\s/g, ''),
     raw.replace(/[^ぁ-んァ-ヶー一-龯A-Za-z0-9]/g, ''),
     raw.replace(/[^ぁ-んァ-ヶー一-龯]/g, '')];
-  for (var v = 0; v < variants.length; v++) {
-    for (var i = 0; i < CATEGORY_HINTS.length; i++) {
+  for (var i = 0; i < CATEGORY_HINTS.length; i++) {
+    for (var v = 0; v < variants.length; v++) {
       if (CATEGORY_HINTS[i][0].test(variants[v])) return CATEGORY_HINTS[i][1];
     }
   }
@@ -540,6 +637,17 @@ function chainHit(text, needle) {
     for (var d = 0; d < skN.length; d++) {
       var cut = skN.slice(0, d) + skN.slice(d + 1);
       if (cut.length >= 4 && skT.indexOf(cut) >= 0) return true;
+    }
+    /* E o caminho inverso (v1.7): o OCR também ENFIA um kana no
+       nome — no aparelho, セブンイレブン saiu "セブンイレルブン"
+       (um ル a mais) e a loja não canonizava. Procura o esqueleto
+       do nome em janelas do texto com um caractere a mais, apagando
+       uma posição por vez. */
+    for (var w = 0; w + skN.length + 1 <= skT.length; w++) {
+      var win = skT.slice(w, w + skN.length + 1);
+      for (var del = 0; del < win.length; del++) {
+        if (win.slice(0, del) + win.slice(del + 1) === skN) return true;
+      }
     }
   }
   return false;
@@ -919,6 +1027,12 @@ function sanitizeItem(raw) {
        `createdAt` — a melhor aproximação do dia da foto. */
     photoAt: (typeof raw.photoAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.photoAt))
       ? raw.photoAt : isoFromMs(createdAt),
+    /* v1.7: o texto bruto do OCR que gerou o item (passadas
+       combinadas, até ~6.000 caracteres). É diagnóstico — não entra
+       em nenhum cálculo — e viaja no backup pra qualquer falha
+       futura ser investigável sem simular o aparelho. Item antigo
+       ou vindo de QR/formulário fica ''. */
+    ocrText: typeof raw.ocrText === 'string' ? raw.ocrText.slice(0, 6000) : '',
     createdAt: createdAt
   };
 }
@@ -1341,6 +1455,16 @@ function renderDetail(id) {
     return '<div><dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd></div>';
   }).join('');
 
+  /* v1.7: o texto bruto do OCR, recolhível — diagnóstico quando
+     algum campo saiu errado. Item sem leitura (QR, manual, antigo)
+     não mostra a seção. (Com guarda: um index.html antigo em cache
+     não pode quebrar o detalhe.) */
+  var ow = $('dOcrWrap');
+  if (ow && it.ocrText) {
+    $('dOcrText').textContent = it.ocrText;
+    ow.classList.remove('hidden');
+  } else if (ow) ow.classList.add('hidden');
+
   var tp = $('btnTogglePaid');
   if (it.type === 'conta') {
     tp.classList.remove('hidden');
@@ -1414,6 +1538,7 @@ function saveFromForm() {
       data.paid = old.paid; data.createdAt = old.createdAt;
       data.phone = old.phone || '';
       data.photoAt = old.photoAt || null; // foto não muda na edição
+      data.ocrText = old.ocrText || ''; // leitura original não muda na edição
       /* Se o nome não mudou, mantém lugar/filial; se mudou, o lugar
          passa a ser o nome novo (sem filial). */
       if (data.store === old.store) {
@@ -1463,6 +1588,7 @@ function saveExtractedItem(data, photo, link) {
     link: link || '',
     photo: photo || null,
     photoAt: data.photoAt || null,
+    ocrText: data.ocrText || '',
     createdAt: Date.now()
   });
   items.push(item);
@@ -1691,6 +1817,7 @@ function runOCR(dataUrl) {
     box.classList.add('hidden');
     var data = extractFromText(text);
     data.photoAt = pendingPhotoAt;
+    data.ocrText = text;
     saveExtractedItem(data, dataUrl, '');
   }).catch(function () {
     /* Plano B: leitura simples, como era antes da v1.5. */
@@ -1706,6 +1833,7 @@ function runOCR(dataUrl) {
       var text = (res && res.data && res.data.text) || '';
       var data = extractFromText(text);
       data.photoAt = pendingPhotoAt;
+      data.ocrText = text;
       saveExtractedItem(data, dataUrl, '');
     }).catch(function () {
       box.classList.add('hidden');
