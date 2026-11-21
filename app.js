@@ -1,4 +1,4 @@
-/* Meus Recibos JP — v1.5
+/* Meus Recibos JP — v1.6
    Tudo fica no aparelho (localStorage, prefixo rec-). Nada é enviado a terceiros.
    A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn).
    v1.3: extração reforçada (nome fantasia, total/valor pago/troco) e
@@ -12,7 +12,17 @@
    escalas/recortes diferentes, com os textos combinados; extração
    tolerante a erros típicos do OCR (0→C/Z no ano, "/"→7 na data,
    "2.900" com ponto, お預り sem o 預 legível, 9 lido como 3 etc.).
-   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.5.md (fora do repo). */
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.5.md (fora do repo).
+   v1.6: fidelidade ao recibo — o total é o 合計 impresso; 小計（税抜）
+   nunca vira total (com 消費税 lido e o 合計 ilegível, o total é a
+   soma dos dois componentes impressos, confirmada por outro valor
+   do papel); a taxa ("8%") não é mais confundida com dinheiro; data
+   no formato 年月日 com espaços entre os blocos; rede canoniza
+   mesmo com kana trocado/engolido ("セブンイブン" → セブン-イレブン);
+   valor picado do rodapé ("1. 06 ら 0") recompõe o お預り; e cada
+   item guarda `photoAt` (data da foto, via EXIF) separado da data
+   do recibo — quem manda em totais/histórico/Lugares é a do recibo.
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.6.md (fora do repo). */
 'use strict';
 
 /* ============ Constantes ============ */
@@ -71,13 +81,15 @@ function findAllDates(text) {
     var y = +m[1], mo = +m[2], d = +m[3];
     if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) out.push(toISODate(y, mo, d));
   }
-  var re2 = /(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日/g;
+  /* O OCR devolve "2026 年 10 月 02 日" — espaços entre TODOS os
+     blocos, inclusive entre o ano e o 年 (v1.6). */
+  var re2 = /(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/g;
   while ((m = re2.exec(text)) !== null) {
     var y2 = +m[1], mo2 = +m[2], d2 = +m[3];
     if (mo2 >= 1 && mo2 <= 12 && d2 >= 1 && d2 <= 31) out.push(toISODate(y2, mo2, d2));
   }
   // Reiwa: 令和N年 = 2018 + N
-  var re3 = /令和\s*(\d{1,2})年\s*(\d{1,2})月\s*(\d{1,2})日/g;
+  var re3 = /令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/g;
   while ((m = re3.exec(text)) !== null) {
     out.push(toISODate(2018 + (+m[1]), +m[2], +m[3]));
   }
@@ -184,6 +196,14 @@ function numbersInLineFuzzy(line) {
   return out;
 }
 
+/* Tira as taxas percentuais ("8%", "10％") de uma linha antes de
+   procurar dinheiro: o número da taxa NÃO é valor — era ele que
+   virava o "total" quando o OCR perdia a coluna de valores
+   ("小計(税抜8%)" devolvia 8). */
+function stripRates(s) {
+  return String(s).replace(/\d{1,2}\s*[%％]/g, ' ');
+}
+
 /* Procura uma palavra-chave (comparando sem espaços, porque o OCR
    devolve "合 計" / "お 釣 り") e devolve o maior número depois dela na
    mesma linha; se a linha não tiver número, olha a linha seguinte. */
@@ -193,9 +213,9 @@ function moneyByKeywords(lines, keywords) {
     for (var k = 0; k < keywords.length; k++) {
       var pos = stripped.indexOf(keywords[k]);
       if (pos < 0) continue;
-      var nums = numbersInLineFuzzy(stripped.slice(pos + keywords[k].length));
-      if (!nums.length) nums = numbersInLineFuzzy(lines[i]);
-      if (!nums.length && i + 1 < lines.length) nums = numbersInLineFuzzy(lines[i + 1]);
+      var nums = numbersInLineFuzzy(stripRates(stripped.slice(pos + keywords[k].length)));
+      if (!nums.length) nums = numbersInLineFuzzy(stripRates(lines[i]));
+      if (!nums.length && i + 1 < lines.length) nums = numbersInLineFuzzy(stripRates(lines[i + 1]));
       if (nums.length) return Math.max.apply(null, nums);
     }
   }
@@ -204,7 +224,7 @@ function moneyByKeywords(lines, keywords) {
 
 var TOTAL_KEYWORDS = ['合計金額', '税込合計', 'お買上計', 'お買い上げ',
   '請求金額', 'お支払金額', 'お支払い金額', '合計'];
-var TENDERED_KEYWORDS = ['お預かり金', 'お預かり', 'お預り', '預り金'];
+var TENDERED_KEYWORDS = ['お預かり金', 'お預かり', 'お預り', '預り金', '預り'];
 var CHANGE_KEYWORDS = ['お釣り', 'おつり', '釣銭', '釣り銭'];
 
 /* Linhas "お?り": o recibo imprime お預り (valor entregue) e depois
@@ -234,16 +254,134 @@ function changeCandidates(line) {
   return out;
 }
 
+/* Observações de 小計 no texto inteiro: as passadas repetem a mesma
+   linha com ruídos diferentes — agrupa por valor (o mais frequente
+   vence) e anota o qualificador: 税抜 em QUALQUER leitura daquele
+   valor marca o subtotal como "sem imposto". */
+function scanSubtotals(lines) {
+  var byVal = {}, order = [];
+  for (var i = 0; i < lines.length; i++) {
+    var st = lines[i].replace(/\s/g, '');
+    var pos = st.indexOf('小計');
+    if (pos < 0) continue;
+    var nums = numbersInLineFuzzy(stripRates(st.slice(pos + 2)));
+    if (!nums.length) nums = numbersInLineFuzzy(stripRates(lines[i]));
+    if (!nums.length && i + 1 < lines.length) nums = numbersInLineFuzzy(stripRates(lines[i + 1]));
+    if (!nums.length) continue;
+    var v = Math.max.apply(null, nums);
+    if (!byVal[v]) { byVal[v] = { value: v, taxExcluded: false, count: 0 }; order.push(v); }
+    byVal[v].count++;
+    if (st.indexOf('税抜') >= 0) byVal[v].taxExcluded = true;
+  }
+  var best = null;
+  for (var j = 0; j < order.length; j++) {
+    if (!best || byVal[order[j]].count > best.count) best = byVal[order[j]];
+  }
+  return best;
+}
+
+/* Observações de 消費税: separa a linha "solta" (a que é SOMADA ao
+   小計（税抜）pra formar o total) da linha "（内…）" (que só informa
+   quanto de imposto já está incluso num total 税込）. */
+function scanTaxes(lines) {
+  var loose = [], inner = [];
+  for (var i = 0; i < lines.length; i++) {
+    var st = lines[i].replace(/\s/g, '');
+    var pos = st.indexOf('消費税');
+    if (pos < 0) continue;
+    var nums = numbersInLineFuzzy(stripRates(st.slice(pos + 3)));
+    if (!nums.length) nums = numbersInLineFuzzy(stripRates(lines[i]));
+    if (!nums.length && i + 1 < lines.length) nums = numbersInLineFuzzy(stripRates(lines[i + 1]));
+    if (!nums.length) continue;
+    var v = Math.max.apply(null, nums);
+    if (st.indexOf('内消費税') >= 0) inner.push(v); else loose.push(v);
+  }
+  return { loose: loose, inner: inner };
+}
+
+/* Todos os números "de dinheiro" do texto (sem taxas), como conjunto
+   — usado pra confirmar candidatos: uma soma 小計＋消費税 só é
+   aceita de olhos fechados quando o próprio papel traz esse valor
+   impresso em outra linha （対象, お預り…). */
+function collectAllNumbers(lines) {
+  var set = {};
+  for (var i = 0; i < lines.length; i++) {
+    numbersInLineFuzzy(stripRates(lines[i])).forEach(function (v) { set[v] = true; });
+  }
+  return set;
+}
+
+/* Recompõe um valor "picado" do rodapé térmico: os grupos de dígitos
+   depois do rótulo, concatenados em ordem ("1. 06 ら 0" → 1060).
+   Só com 2+ grupos e 3–7 dígitos no total — fora disso é chute. */
+function digitConcatValue(s) {
+  var mapped = String(s).replace(/[OoUu]/g, '0').replace(/[Il]/g, '1');
+  var runs = mapped.match(/\d+/g);
+  if (!runs || runs.length < 2) return null;
+  var joined = runs.join('');
+  if (joined.length < 3 || joined.length > 7) return null;
+  var v = parseInt(joined, 10);
+  return v > 0 ? v : null;
+}
+
+/* Candidatos picados das linhas de entregue (預） e troco （釣）:
+   o valor depois do kanji do rótulo, com os dígitos concatenados. */
+function labelConcatCandidates(lines, tOut, cOut) {
+  for (var i = 0; i < lines.length; i++) {
+    var st = lines[i].replace(/\s/g, '');
+    var p = st.lastIndexOf('預');
+    if (p >= 0) {
+      var vt = digitConcatValue(st.slice(p + 1).replace(/^り/, ''));
+      if (vt !== null && tOut.indexOf(vt) < 0) tOut.push(vt);
+    }
+    var q = st.lastIndexOf('釣');
+    if (q >= 0) {
+      var vc = digitConcatValue(st.slice(q + 1).replace(/^り/, ''));
+      if (vc !== null && cOut.indexOf(vc) < 0) cOut.push(vc);
+    }
+  }
+}
+
 /* Extrai total, valor entregue (お預かり) e troco (お釣り) do texto.
    tendered/change ficam null quando não aparecem no papel.
    v1.5: total também via 小計 e, em último caso, via um 計 solto;
    tendered/change combinam palavra-chave, linhas お?り e a conta
-   tendered − total = troco quando as evidências concordam. */
+   tendered − total = troco quando as evidências concordam.
+   v1.6: fidelidade ao recibo — o 合計 impresso manda; 小計（税抜）
+   nunca é o total (com 消費税 lido, o total é a soma dos dois
+   componentes impressos); 小計 税込/sem qualificador já é o total. */
 function extractMoney(rawText) {
   var text = normalizeOcr(rawText);
   var lines = text.split(/\n/);
   var amount = moneyByKeywords(lines, TOTAL_KEYWORDS);
-  if (amount === null) amount = moneyByKeywords(lines, ['小計']);
+  if (amount === null) {
+    var sub = scanSubtotals(lines);
+    if (sub) {
+      if (!sub.taxExcluded) {
+        amount = sub.value;
+      } else {
+        /* 小計（税抜）+ 消費税： o total é a soma dos dois valores
+           impressos. Entre os candidatos de imposto, prefere o que
+           faz a soma aparecer impressa em outra linha do papel. */
+        var taxes = scanTaxes(lines);
+        var taxCands = [];
+        taxes.loose.concat(taxes.inner).forEach(function (v) {
+          if (taxCands.indexOf(v) < 0) taxCands.push(v);
+        });
+        if (taxCands.length) {
+          var allNums = collectAllNumbers(lines);
+          var chosenTax = null;
+          for (var ti = 0; ti < taxCands.length; ti++) {
+            if (allNums[sub.value + taxCands[ti]]) { chosenTax = taxCands[ti]; break; }
+          }
+          if (chosenTax === null) chosenTax = taxCands[0];
+          amount = sub.value + chosenTax;
+        } else {
+          amount = sub.value;
+        }
+      }
+    }
+  }
   if (amount === null) {
     for (var i = 0; i < lines.length; i++) {
       var st = lines[i].replace(/\s/g, '');
@@ -276,6 +414,8 @@ function extractMoney(rawText) {
   var tenderedKw = moneyByKeywords(lines, TENDERED_KEYWORDS);
   var changeKw = moneyByKeywords(lines, CHANGE_KEYWORDS);
   var ojiri = ojiriLines(lines);
+  var concatT = [], concatC = [];
+  labelConcatCandidates(lines, concatT, concatC);
 
   /* Valor entregue e troco: as linhas お?り das várias passadas se
      misturam (cada passada traz o seu par お預り/お釣り). Com o total
@@ -298,6 +438,13 @@ function extractMoney(rawText) {
       if (o.nums.length) hasChangeLine = true;
     });
     if (tPool.length) tendered = Math.min.apply(null, tPool);
+    concatT.forEach(function (v) {
+      if (v >= amount && (tendered === null || v < tendered)) tendered = v;
+    });
+    concatC.forEach(function (v) {
+      if (v > 0 && v < amount && cCands.indexOf(v) < 0) cCands.push(v);
+    });
+    if (concatC.length) hasChangeLine = true;
     if (changeKw !== null && changeKw < amount && cCands.indexOf(changeKw) < 0) {
       cCands.push(changeKw);
     }
@@ -315,14 +462,16 @@ function extractMoney(rawText) {
     }
   }
 
-  /* Troco: se algum candidato bate com tendered − total, ele vence;
-     senão, um candidato único é aceito como lido; senão, a aritmética
-     vale quando há linha de troco e o resultado é plausível (troco
-     menor que o total). */
+  /* Troco: pagou EXATO (entregue = total) → troco é 0 por definição,
+     não é chute. Se algum candidato bate com tendered − total, ele
+     vence; senão, um candidato único é aceito como lido; senão, a
+     aritmética vale quando há linha de troco e o resultado é
+     plausível (troco menor que o total). */
   var expected = (tendered !== null && amount !== null && tendered >= amount)
     ? tendered - amount : null;
   var change = null;
-  if (expected !== null && cCands.indexOf(expected) >= 0) change = expected;
+  if (expected !== null && expected === 0) change = 0;
+  else if (expected !== null && cCands.indexOf(expected) >= 0) change = expected;
   else if (cCands.length === 1) change = cCands[0];
   else if (expected !== null && hasChangeLine && expected < amount && expected <= 5000) change = expected;
   else if (cCands.length) change = cCands[0];
@@ -378,7 +527,36 @@ function chainHit(text, needle) {
   if (n2.length >= 2 && clean.indexOf(n2) >= 0) return true;
   var nK = n1.replace(/[^ぁ-んァ-ヶー一-龯]/g, '');
   var cleanK = String(text).replace(/[^ぁ-んァ-ヶー一-龯]/g, '');
-  return nK.length >= 2 && cleanK.indexOf(nK) >= 0;
+  if (nK.length >= 2 && cleanK.indexOf(nK) >= 0) return true;
+  /* Passada difusa (v1.6): o OCR troca kana "vizinhos" (ブ↔フ↔プ,
+     レ↔ル) e às vezes engole um kana do nome ("セブンイブン" por
+     セブンイレブン). Normaliza os dois lados pro mesmo "esqueleto"
+     e aceita também o nome com um kana a menos. Só pra nomes com
+     5+ kana no esqueleto — curto demais viraria falso positivo. */
+  var skN = kanaSkeleton(n1);
+  if (skN.length >= 5) {
+    var skT = kanaSkeleton(text);
+    if (skT.indexOf(skN) >= 0) return true;
+    for (var d = 0; d < skN.length; d++) {
+      var cut = skN.slice(0, d) + skN.slice(d + 1);
+      if (cut.length >= 4 && skT.indexOf(cut) >= 0) return true;
+    }
+  }
+  return false;
+}
+
+/* "Esqueleto" kana de um texto: só kana/kanji, sem o "ー", com os
+   pares que o OCR confunde dobrados pro mesmo sinal (ハ行 com e sem
+   dakuten vira ハ行; ル vira レ). Aplicado dos dois lados da
+   comparação, então o nome certo continua casando consigo mesmo. */
+function kanaSkeleton(s) {
+  var t = String(s).replace(/[^ぁ-んァ-ヶー一-龯]/g, '');
+  t = t.replace(/[バビブベボパピプペポ]/g, function (c) {
+    return 'ハヒフヘホ'[ 'バビブベボパピプペポ'.indexOf(c) % 5 ];
+  });
+  t = t.replace(/ル/g, 'レ');
+  t = t.replace(/ー/g, '');
+  return t;
 }
 
 /* Redes conhecidas: [trecho procurado no texto sem espaços, nome exibido].
@@ -509,14 +687,9 @@ function extractPlaceInfo(rawText) {
       }
     }
     if (!branch) {
-      /* Filial "…駅前" (ex.: 生麦駅前) numa linha do cabeçalho. */
-      for (var e = 0; e < Math.min(lines.length, 10) && !branch; e++) {
-        var se = lines[e].replace(/\s/g, '');
-        var me = /[ぁ-んァ-ヶー一-龯]{1,4}駅前/.exec(se);
-        if (me) branch = me[0];
-      }
-    }
-    if (!branch) {
+      /* Linha do cabeçalho que é SÓ o nome da filial, terminando em
+         店 (ex.: 横浜京急生麦駅前店) — vale mais que um recorte
+         parcial da mesma linha. */
       for (var k = 0; k < Math.min(lines.length, 8); k++) {
         var s = lines[k].trim().replace(/\s/g, '');
         if (s.length < 3 || s.length > 14) continue;
@@ -528,6 +701,14 @@ function extractPlaceInfo(rawText) {
         if (s.indexOf(needle) >= 0) continue;
         branch = s;
         break;
+      }
+    }
+    if (!branch) {
+      /* Filial "…駅前" (ex.: 生麦駅前) numa linha do cabeçalho. */
+      for (var e = 0; e < Math.min(lines.length, 10) && !branch; e++) {
+        var se = lines[e].replace(/\s/g, '');
+        var me = /[ぁ-んァ-ヶー一-龯]{1,4}駅前/.exec(se);
+        if (me) branch = me[0];
       }
     }
     return {
@@ -578,6 +759,119 @@ function extractFromText(rawText) {
   };
 }
 
+/* ============ Data da foto (photoAt) ============
+   `date` é a data IMPRESSA no recibo — é ela que vale pra totais,
+   histórico e Lugares. `photoAt` é outra coisa: o dia em que a foto
+   foi tirada/importada, guardado separado pra conferência. */
+
+/* ms → 'YYYY-MM-DD' (data local). */
+function isoFromMs(ms) {
+  var d = new Date(ms);
+  if (isNaN(d.getTime())) return todayISO();
+  return toISODate(d.getFullYear(), d.getMonth() + 1, d.getDate());
+}
+
+/* Lê a data de captura do EXIF de um JPEG (bytes crus do arquivo).
+   Parser mínimo: segmentos JPEG → APP1 "Exif" → TIFF (II ou MM) →
+   ExifIFD (ponteiro 0x8769) → DateTimeOriginal (0x9003); sem ele,
+   vale o DateTime do IFD0 (0x0132). TEM que ler do arquivo original:
+   o canvas do downscale apaga o EXIF. Devolve 'YYYY-MM-DD' ou null. */
+function parseExifDate(bytes) {
+  if (!bytes || bytes.length < 4) return null;
+  if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) return null;
+  var pos = 2;
+  while (pos + 4 <= bytes.length) {
+    if (bytes[pos] !== 0xFF) return null;
+    var marker = bytes[pos + 1];
+    if (marker === 0xDA || marker === 0xD9) return null;
+    var len = (bytes[pos + 2] << 8) | bytes[pos + 3];
+    if (len < 2) return null;
+    if (marker === 0xE1 && pos + 10 <= bytes.length &&
+        bytes[pos + 4] === 0x45 && bytes[pos + 5] === 0x78 &&
+        bytes[pos + 6] === 0x69 && bytes[pos + 7] === 0x66 &&
+        bytes[pos + 8] === 0 && bytes[pos + 9] === 0) {
+      return exifDateFromTiff(bytes, pos + 10);
+    }
+    pos += 2 + len;
+  }
+  return null;
+}
+
+function exifDateFromTiff(b, t0) {
+  if (t0 + 8 > b.length) return null;
+  var little = b[t0] === 0x49 && b[t0 + 1] === 0x49;
+  var big = b[t0] === 0x4D && b[t0 + 1] === 0x4D;
+  if (!little && !big) return null;
+  function u16(o) {
+    return little ? (b[o] | (b[o + 1] << 8)) : ((b[o] << 8) | b[o + 1]);
+  }
+  function u32(o) {
+    return little
+      ? ((b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0)
+      : (((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0);
+  }
+  if (u16(t0 + 2) !== 42) return null;
+  function readIfd(off) {
+    var entries = {};
+    if (off < t0 || off + 2 > b.length) return entries;
+    var n = u16(off), i, e;
+    for (i = 0; i < n; i++) {
+      e = off + 2 + i * 12;
+      if (e + 12 > b.length) break;
+      entries[u16(e)] = { type: u16(e + 2), count: u32(e + 4), valOff: e + 8, raw: u32(e + 8) };
+    }
+    return entries;
+  }
+  function asciiOf(ent) {
+    if (!ent || ent.type !== 2 || !ent.count) return null;
+    var start = ent.count <= 4 ? ent.valOff : t0 + ent.raw;
+    if (start < 0 || start >= b.length) return null;
+    var s = '';
+    for (var i = 0; i < ent.count && start + i < b.length; i++) {
+      var c = b[start + i];
+      if (c === 0) break;
+      s += String.fromCharCode(c);
+    }
+    return s;
+  }
+  function toISODateStr(s) {
+    if (!s) return null;
+    var m = /(\d{4}):(\d{2}):(\d{2})/.exec(s);
+    if (!m) return null;
+    var y = +m[1], mo = +m[2], d = +m[3];
+    if (y < 1990 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+    return toISODate(y, mo, d);
+  }
+  var ifd0 = readIfd(t0 + u32(t0 + 4));
+  var ptr = ifd0[0x8769];
+  if (ptr) {
+    var dto = toISODateStr(asciiOf(readIfd(t0 + ptr.raw)[0x9003]));
+    if (dto) return dto;
+  }
+  return toISODateStr(asciiOf(ifd0[0x0132]));
+}
+
+/* Prioridade da data da foto: EXIF → lastModified do arquivo → agora. */
+function resolvePhotoAt(exifISO, lastModified, nowMs) {
+  if (exifISO) return exifISO;
+  if (lastModified) return isoFromMs(lastModified);
+  return isoFromMs(nowMs || Date.now());
+}
+
+/* Lê o EXIF do arquivo escolhido (antes de qualquer canvas) e
+   resolve o photoAt; qualquer falha cai pro lastModified/agora. */
+function readPhotoAt(file, cb) {
+  var finish = function (exifISO) {
+    cb(resolvePhotoAt(exifISO, file && file.lastModified, Date.now()));
+  };
+  if (!file || typeof file.arrayBuffer !== 'function') { finish(null); return; }
+  file.arrayBuffer().then(function (buf) {
+    var iso = null;
+    try { iso = parseExifDate(new Uint8Array(buf)); } catch (e) { iso = null; }
+    finish(iso);
+  }, function () { finish(null); });
+}
+
 /* ============ Armazenamento ============ */
 function loadItems() {
   try {
@@ -595,6 +889,7 @@ function sanitizeItem(raw) {
   if (!raw || typeof raw !== 'object' || !raw.id) return null;
   var type = TYPES[raw.type] ? raw.type : 'recibo';
   var store = String(raw.store || '');
+  var createdAt = raw.createdAt || Date.now();
   /* Migração v1.4: item antigo sem `place` herda o nome da loja
      (normalizado) — nenhum dado se perde. */
   var place = normalizePlaceName(
@@ -620,7 +915,11 @@ function sanitizeItem(raw) {
     note: String(raw.note || ''),
     link: String(raw.link || ''),
     photo: typeof raw.photo === 'string' && raw.photo.indexOf('data:image') === 0 ? raw.photo : null,
-    createdAt: raw.createdAt || Date.now()
+    /* Migração v1.6: item antigo sem `photoAt` herda o dia do
+       `createdAt` — a melhor aproximação do dia da foto. */
+    photoAt: (typeof raw.photoAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.photoAt))
+      ? raw.photoAt : isoFromMs(createdAt),
+    createdAt: createdAt
   };
 }
 function mergeImport(existing, incoming) {
@@ -711,6 +1010,7 @@ var items = [];
 var viewMonth = null; // {y, m} m = 0..11
 var editingId = null;
 var pendingPhoto = null;
+var pendingPhotoAt = null; // data da foto do arquivo em leitura (EXIF)
 var pendingLink = '';
 var currentDetailId = null;
 var placesYear = 'todos'; // filtro da aba Lugares
@@ -1019,9 +1319,10 @@ function renderDetail(id) {
 
   var rows = [
     ['Tipo', TYPES[it.type]],
-    ['Data', fmtDateBR(it.date)],
+    ['Data do recibo', fmtDateBR(it.date)],
     ['Valor', it.amount > 0 ? fmtYen(it.amount) : '—']
   ];
+  if (it.photoAt) rows.push(['Foto', fmtDateBR(it.photoAt)]);
   if (it.tendered > 0) rows.push(['Valor pago', fmtYen(it.tendered)]);
   if (it.change > 0) rows.push(['Troco', fmtYen(it.change)]);
   if (it.type === 'recibo') rows.push(['Categoria', it.category]);
@@ -1112,6 +1413,7 @@ function saveFromForm() {
     if (old) {
       data.paid = old.paid; data.createdAt = old.createdAt;
       data.phone = old.phone || '';
+      data.photoAt = old.photoAt || null; // foto não muda na edição
       /* Se o nome não mudou, mantém lugar/filial; se mudou, o lugar
          passa a ser o nome novo (sem filial). */
       if (data.store === old.store) {
@@ -1160,6 +1462,7 @@ function saveExtractedItem(data, photo, link) {
     note: data.note || '',
     link: link || '',
     photo: photo || null,
+    photoAt: data.photoAt || null,
     createdAt: Date.now()
   });
   items.push(item);
@@ -1381,12 +1684,13 @@ function runOCR(dataUrl) {
   $('ocrBar').style.width = '5%';
   if (typeof Tesseract === 'undefined' || !Tesseract.createWorker) {
     box.classList.add('hidden');
-    saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '');
+    saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros', photoAt: pendingPhotoAt }, dataUrl, '');
     return;
   }
   prepareAndOcr(dataUrl).then(function (text) {
     box.classList.add('hidden');
     var data = extractFromText(text);
+    data.photoAt = pendingPhotoAt;
     saveExtractedItem(data, dataUrl, '');
   }).catch(function () {
     /* Plano B: leitura simples, como era antes da v1.5. */
@@ -1400,16 +1704,22 @@ function runOCR(dataUrl) {
     }).then(function (res) {
       box.classList.add('hidden');
       var text = (res && res.data && res.data.text) || '';
-      saveExtractedItem(extractFromText(text), dataUrl, '');
+      var data = extractFromText(text);
+      data.photoAt = pendingPhotoAt;
+      saveExtractedItem(data, dataUrl, '');
     }).catch(function () {
       box.classList.add('hidden');
-      saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros' }, dataUrl, '');
+      saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros', photoAt: pendingPhotoAt }, dataUrl, '');
     });
   });
 }
 function handlePhotoFile(file) {
   if (!file) return;
-  downscaleImage(file, function (dataUrl) { runOCR(dataUrl); });
+  /* EXIF primeiro: o downscale (canvas) apaga os metadados. */
+  readPhotoAt(file, function (photoAt) {
+    pendingPhotoAt = photoAt;
+    downscaleImage(file, function (dataUrl) { runOCR(dataUrl); });
+  });
 }
 
 /* ============ QR Code ============ */
@@ -1779,10 +2089,10 @@ function bindEvents() {
 function init() {
   var rawItems = loadItems();
   var needsMigration = rawItems.some(function (r) {
-    return r && typeof r === 'object' && r.place === undefined;
+    return r && typeof r === 'object' && (r.place === undefined || r.photoAt === undefined);
   });
   items = rawItems.map(sanitizeItem).filter(Boolean);
-  if (needsMigration) saveItems(items); // grava place/branch/phone derivados
+  if (needsMigration) saveItems(items); // grava place/branch/phone/photoAt derivados
   var now = new Date();
   viewMonth = { y: now.getFullYear(), m: now.getMonth() };
   fillSelects();
@@ -1811,6 +2121,8 @@ if (typeof module !== 'undefined' && module.exports) {
     extractStore: extractStore, extractPlaceInfo: extractPlaceInfo,
     extractPhone: extractPhone, normalizeOcr: normalizeOcr,
     normalizePlaceName: normalizePlaceName,
+    parseExifDate: parseExifDate, resolvePhotoAt: resolvePhotoAt,
+    isoFromMs: isoFromMs,
     groupPlaces: groupPlaces, placeYears: placeYears,
     findAllDates: findAllDates,
     fmtYen: fmtYen, fmtDateBR: fmtDateBR, mergeImport: mergeImport,
