@@ -71,7 +71,7 @@
 'use strict';
 
 /* ============ Constantes ============ */
-var APP_VERSION = '1.12';
+var APP_VERSION = '1.13';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -85,7 +85,7 @@ var CATEGORY_HINTS = [
   [/ドラッグ|薬局|マツモトキヨシ|ウエルシア|スギ薬局/, 'Farmácia'],
   [/病院|クリニック|歯科|眼科/, 'Saúde'],
   [/スーパー|イオン|業務スーパー|西友|ライフ|マルエツ|サンワ|コストコ|マイバスケット|オーケー/, 'Supermercado'],
-  [/サイゼリヤ|ガスト|マクドナルド|モスバーガー|すき家|吉野家|松屋|日高屋|スシロー|くら寿司|はま寿司|かっぱ寿司|コメダ|スターバックス|ドトール|タリーズ|レストラン|食堂|ラーメン|居酒屋|カフェ/, 'Restaurante'],
+  [/サイゼリヤ|ガスト|マクドナルド|モスバーガー|すき家|吉野家|松屋|日高屋|スシロー|くら寿司|はま寿司|かっぱ寿司|コメダ|スターバックス|ドトール|タリーズ|レストラン|食堂|ラーメン|居酒屋|カフェ|STARBUCKS/i, 'Restaurante'],
   [/バーガー|burger/i, 'Restaurante'],
   [/ダイソー|セリア|キャンドゥ|3COINS|ブックオフ|ハードオフ|ドン・キホーテ/, 'Compras'],
   [/電車|バス|タクシー|Suica|PASMO|チャージ/, 'Transporte'],
@@ -403,6 +403,21 @@ function scanTaishou(lines) {
   return order;
 }
 
+/* v1.13: o valor aparece impresso numa linha de "計" do papel
+   (合計/総合計, mesmo degradada — "総台計"), fora das linhas de
+   対象 (que carregam a base, não o total)? A leitura G→6 é local
+   a esta checagem: o "G18" da linha do 総合計 é o 618 com a
+   primeira casa trocada pelo OCR. */
+function totalPrintedOnKeLine(lines, v) {
+  for (var i = 0; i < lines.length; i++) {
+    var st = lines[i].replace(/\s/g, '');
+    if (st.indexOf('計') < 0 || st.indexOf('対象') >= 0) continue;
+    var mapped = st.replace(/[Gg]/g, '6');
+    if (numbersInLineFuzzy(mapped).indexOf(v) >= 0) return true;
+  }
+  return false;
+}
+
 /* Todos os números "de dinheiro" do texto (sem taxas), como conjunto
    — usado pra confirmar candidatos: uma soma 小計＋消費税 só é
    aceita de olhos fechados quando o próprio papel traz esse valor
@@ -639,6 +654,20 @@ function extractMoney(rawText) {
       }
     }
   }
+  /* v1.13: guarda do total impossível — um candidato a total MENOR
+     que a maior base 対象 impressa não pode ser o total: a base já
+     é parte do total (com imposto, é parcela dele; sem imposto, é
+     menor que ele). Caso real do aparelho (Starbucks, 2026-11-22):
+     a linha do 合計 saiu destruída ("合計 ... ら 7 い") e o
+     fragmento "7" virou o total, com a base "(8%対象 ¥573)"
+     legível no mesmo papel. Candidato impossível é descartado e
+     a cadeia de reservas abaixo roda. */
+  if (amount !== null) {
+    var tshGuard = scanTaishou(lines);
+    if (tshGuard.length && amount < Math.max.apply(null, tshGuard)) {
+      amount = null;
+    }
+  }
   if (amount === null) {
     /* Sem subtotal aproveitável: a soma das bases 対象 é o total
        (taxa única: a própria base; duas taxas: a soma delas). */
@@ -647,6 +676,27 @@ function extractMoney(rawText) {
       var tsum = tsh.reduce(function (s3, v3) { return s3 + v3; }, 0);
       if (tsum >= 100 && (!sub || !sub.taxExcluded || tsum > sub.value)) {
         amount = tsum;
+        /* v1.13: arbitragem da base SEM imposto — cadeias como a
+           Starbucks imprimem a base 対象 sem o imposto ("(8%対象
+           ¥573 消費税 ¥45)") e o total é base + imposto. Com UMA
+           base só, se o fechamento base+imposto (a 8% ou a 10%)
+           aparece impresso numa linha de 計 do papel, é ELE o
+           total, não a base. Sem essa confirmação impressa, vale
+           a soma das bases (leitura com imposto) — a aritmética
+           não cria valor, só desempata entre valores impressos. */
+        if (tsh.length === 1) {
+          var baseV = tsh[0];
+          var closures13 = [baseV + Math.floor(baseV * 8 / 100),
+                            baseV + Math.floor(baseV * 10 / 100)];
+          var confirmed13 = [];
+          for (var ci = 0; ci < closures13.length; ci++) {
+            if (closures13[ci] === tsum) continue;
+            if (totalPrintedOnKeLine(lines, closures13[ci])) {
+              confirmed13.push(closures13[ci]);
+            }
+          }
+          if (confirmed13.length === 1) amount = confirmed13[0];
+        }
       }
     }
   }
