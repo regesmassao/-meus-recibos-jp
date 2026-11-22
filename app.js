@@ -71,7 +71,7 @@
 'use strict';
 
 /* ============ Constantes ============ */
-var APP_VERSION = '1.10';
+var APP_VERSION = '1.11';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -86,6 +86,7 @@ var CATEGORY_HINTS = [
   [/病院|クリニック|歯科|眼科/, 'Saúde'],
   [/スーパー|イオン|業務スーパー|西友|ライフ|マルエツ|サンワ|コストコ|マイバスケット|オーケー/, 'Supermercado'],
   [/サイゼリヤ|ガスト|マクドナルド|モスバーガー|すき家|吉野家|松屋|日高屋|スシロー|くら寿司|はま寿司|かっぱ寿司|コメダ|スターバックス|ドトール|タリーズ|レストラン|食堂|ラーメン|居酒屋|カフェ/, 'Restaurante'],
+  [/バーガー|burger/i, 'Restaurante'],
   [/ダイソー|セリア|キャンドゥ|3COINS|ブックオフ|ハードオフ|ドン・キホーテ/, 'Compras'],
   [/電車|バス|タクシー|Suica|PASMO|チャージ/, 'Transporte'],
   [/コインランドリー|ランドリー|クリーニング|Lavanderia/i, 'Lavanderia']
@@ -547,6 +548,44 @@ function paymentZoneClose(lines, change, knownTendered) {
   return { amount: +vs[0], tendered: found[vs[0]] };
 }
 
+/* v1.11: total por repetição + imposto consistente. Recibo de
+   lanchonete quase todo em inglês (caso real do aparelho,
+   2026-11-22): TODAS as linhas rotuladas morreram — sem 合計，
+   sem 対象， o "¥" virou "\" e o total só sobreviveu repetido nas
+   passadas ("5,220" ×4, mais a forma "5.220") ao lado do imposto
+   impresso (¥474). Um valor V vira o total quando fecha TRÊS
+   evidências do próprio papel ao mesmo tempo: (1) V aparece
+   ≥ 3 vezes no texto, contando as leituras degradadas
+   equivalentes (countValueOccurrences); (2) o imposto de V —
+   floor(V × taxa/(100+taxa)), taxa 10 ou 8 — está impresso numa
+   linha com 税 (a conta é a do recibo 税込： ¥5.220 → ¥474);
+   (3) V é o ÚNICO valor que fecha (1) e (2) — dois candidatos =
+   ambíguo, não chuta. A aritmética não cria valor nenhum: V e o
+   imposto estão impressos; ela só confere um contra o outro.
+   Preço de item repetido (o hambúrguer de ¥1.980 sai 3×) não
+   fecha porque o imposto dele (¥180/¥146) não está no papel. */
+function repeatedTaxTotal(lines) {
+  var taxSet = {};
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].indexOf('税') < 0) continue;
+    numbersInLineFuzzy(stripRates(lines[i])).forEach(function (v) {
+      if (v >= 20) taxSet[v] = true;
+    });
+  }
+  if (!Object.keys(taxSet).length) return null;
+  var all = collectAllNumbers(lines);
+  var found = [];
+  for (var k in all) {
+    var v = +k;
+    if (v < 300 || taxSet[v]) continue;
+    var okTax = taxSet[Math.floor(v * 10 / 110)] ||
+      taxSet[Math.floor(v * 8 / 108)];
+    if (!okTax) continue;
+    if (countValueOccurrences(lines, v).count >= 3) found.push(v);
+  }
+  return found.length === 1 ? found[0] : null;
+}
+
 /* Extrai total, valor entregue (お預かり) e troco (お釣り) do texto.
    tendered/change ficam null quando não aparecem no papel.
    v1.5: total também via 小計 e, em último caso, via um 計 solto;
@@ -770,6 +809,15 @@ function extractMoney(rawText) {
     if (pz) { amount = pz.amount; tendered = pz.tendered; }
   }
 
+  /* v1.11: último recurso — sem total por nenhum caminho rotulado,
+     o total pode fechar por repetição + imposto consistente
+     (repeatedTaxTotal). Pagamento foi por cartão no caso real,
+     então entregue/troco continuam null: nada é inventado. */
+  if (amount === null) {
+    var rt = repeatedTaxTotal(lines);
+    if (rt !== null) amount = rt;
+  }
+
   return { amount: amount, tendered: tendered, change: change };
 }
 
@@ -922,6 +970,54 @@ function isJunkStoreLine(s) {
   var flat = s.replace(/\s/g, '');
   if (/^\d{4}[\/.-]?\d{1,2}[\/.-]?\d{1,2}/.test(flat)) return true;
   if (/\d{4}年\s*\d{1,2}月\s*\d{1,2}日/.test(s)) return true;
+  /* v1.11: linha com hora (13:17) é a linha da data/hora do recibo,
+     mesmo com a data destruída pelo OCR ("20267 衝 722( 日 )
+     13:17") — nome de loja não tem relógio. */
+  if (/\d{1,2}:\d{2}/.test(s)) return true;
+  /* v1.11: telefone sem o rótulo TEL ("EL 04.-503-2330"), linha de
+     imposto ("(内 費 科 等 8% ¥78)") e código solto sem kana
+     ("2Z33U") viraram "nome da loja" nas passadas cruas quando a
+     linha certa era descartada — nenhum dos três é nome. */
+  if (/0\d{1,4}[-.]\d{1,4}[-.]\d{4}/.test(s) || /\d{9,}/.test(s)) return true;
+  if (/消費税|税等|対象|内消費/.test(s)) return true;
+  if (/[%％]/.test(s)) return true;
+  var flatAll = s.replace(/\s/g, '');
+  if (!/[ぁ-んァ-ヶ一-龯]/.test(flatAll) && /\d/.test(flatAll) &&
+      /[A-Za-z]/.test(flatAll) && !/\s/.test(s.trim())) return true;
+  return false;
+}
+
+/* v1.11: linha fragmentada — o OCR de um nome/logo ilegível
+   devolve kanji e kana SOLTOS, separados por espaço ("大 間 。
+   呈 由 番 弓 1 4 っ", "ンー 0 考"): todos os tokens têm 1–2
+   caracteres. Nome de verdade não vem assim — e rede conhecida
+   já casou antes, no chainHit que ignora espaços (um nome com
+   kana espaçado de verdade, "サイ ゼリ ヤ", tem a sequência de
+   3+ kana ao juntar, e não é marcado). O que não se lê com
+   segurança fica em branco, não vira "nome da loja". */
+function isFragmentedLine(s) {
+  var toks = s.trim().split(/\s+/);
+  if (toks.length < 3) return false;
+  for (var i = 0; i < toks.length; i++) if (toks[i].length > 2) return false;
+  if (toks.length >= 4) return true;
+  var flat = s.replace(/\s/g, '');
+  return !/[ぁ-んァ-ヶ一-龯]{3,}/.test(flat) && !/[A-Za-z]{3,}/.test(s);
+}
+
+/* v1.11: linha de ITEM não é nome da loja — em recibo em inglês,
+   a primeira linha "limpa" do topo pode ser um prato do cardápio
+   ("Avocado cheeSe burger", sem preço naquela passada). Se a
+   mesma linha aparece em outra passada COM preço (≥ ¥100), ela
+   é item: nome de loja nunca é vendido no próprio recibo. */
+function isPricedItemLine(lines, cand) {
+  var c = cand.replace(/\s/g, '').toLowerCase();
+  if (c.length < 4) return false;
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].replace(/\s/g, '').toLowerCase();
+    if (l.length <= c.length || l.indexOf(c) !== 0) continue;
+    var nums = numbersInLineFuzzy(lines[i]);
+    for (var j = 0; j < nums.length; j++) if (nums[j] >= 100) return true;
+  }
   return false;
 }
 
@@ -936,6 +1032,8 @@ function extractStore(rawText) {
     var s = lines[j].trim();
     if (s.length < 2 || s.length > 30) continue;
     if (isJunkStoreLine(s)) continue;
+    if (isFragmentedLine(s)) continue;
+    if (isPricedItemLine(lines, s)) continue;
     if (/株式会社|有限会社|合同会社|（株）|\(株\)/.test(s)) {
       if (!legalFallback) legalFallback = s;
       continue;
