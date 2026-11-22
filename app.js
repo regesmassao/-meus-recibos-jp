@@ -71,7 +71,7 @@
 'use strict';
 
 /* ============ Constantes ============ */
-var APP_VERSION = '1.11';
+var APP_VERSION = '1.12';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -963,7 +963,15 @@ var CHAIN_NAMES = [
 /* Linhas que nunca são o nome da loja: cabeçalhos de recibo, telefone,
    endereço postal, datas, linhas só de números e a linha do total. */
 function isJunkStoreLine(s) {
-  if (/領収書|領収証|いらっしゃいませ|ありがとう/.test(s)) return true;
+  if (/領収書|領収証|レシート|いらっしゃいませ|ありがとう/.test(s)) return true;
+  /* v1.12: linha com "#" (店舗 # 0005, レシート # 410178) é linha
+     de número/terminal, e linha com ¥/\ é linha de dinheiro ou
+     item ("SE1 CorOona EXtra \OoOU") — nenhuma das duas é o nome
+     da loja. No reteste do recibo da lanchonete (2026-11-22) eram
+     essas as linhas que sobravam no topo depois dos descartes da
+     v1.11, e uma delas virava o "nome". */
+  if (/#/.test(s)) return true;
+  if (/[¥￥\\]/.test(s)) return true;
   if (/TEL|電話|〒|郵便|登録番号/.test(s)) return true;
   if (/合計|小計/.test(s)) return true;
   if (/^[0-9¥%.,:：\/\-\s]+$/.test(s)) return true;
