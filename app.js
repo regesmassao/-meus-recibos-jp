@@ -71,7 +71,7 @@
 'use strict';
 
 /* ============ Constantes ============ */
-var APP_VERSION = '1.13';
+var APP_VERSION = '1.14';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -85,8 +85,8 @@ var CATEGORY_HINTS = [
   [/ドラッグ|薬局|マツモトキヨシ|ウエルシア|スギ薬局/, 'Farmácia'],
   [/病院|クリニック|歯科|眼科/, 'Saúde'],
   [/スーパー|イオン|業務スーパー|西友|ライフ|マルエツ|サンワ|コストコ|マイバスケット|オーケー/, 'Supermercado'],
-  [/サイゼリヤ|ガスト|マクドナルド|モスバーガー|すき家|吉野家|松屋|日高屋|スシロー|くら寿司|はま寿司|かっぱ寿司|コメダ|スターバックス|ドトール|タリーズ|レストラン|食堂|ラーメン|居酒屋|カフェ|STARBUCKS/i, 'Restaurante'],
-  [/バーガー|burger/i, 'Restaurante'],
+  [/サイゼリヤ|ガスト|マクドナルド|モスバーガー|すき家|吉野家|松屋|日高屋|スシロー|くら寿司|はま寿司|かっぱ寿司|コメダ|スターバックス|ドトール|タリーズ|レストラン|食堂|ラーメン|居酒屋|カフェ|STARBUCKS|シェイクシャック/i, 'Restaurante'],
+  [/バーガー|burger|patty/i, 'Restaurante'],
   [/ダイソー|セリア|キャンドゥ|3COINS|ブックオフ|ハードオフ|ドン・キホーテ/, 'Compras'],
   [/電車|バス|タクシー|Suica|PASMO|チャージ/, 'Transporte'],
   [/コインランドリー|ランドリー|クリーニング|Lavanderia/i, 'Lavanderia']
@@ -1001,6 +1001,7 @@ var CHAIN_NAMES = [
   ['マツモトキヨシ', 'マツモトキヨシ'], ['ウエルシア', 'ウエルシア'],
   ['サンドラッグ', 'サンドラッグ'], ['クリエイト', 'クリエイト'],
   ['マクドナルド', 'マクドナルド'], ['モスバーガー', 'モスバーガー'],
+  ['シェイクシャック', 'シェイクシャック'], ['Shake Shack', 'シェイクシャック'],
   ['すき家', 'すき家'], ['吉野家', '吉野家'], ['松屋', '松屋'],
   ['ガスト', 'ガスト'], ['サイゼリヤ', 'サイゼリヤ'],
   ['スシロー', 'スシロー'], ['くら寿司', 'くら寿司'],
@@ -1042,6 +1043,13 @@ function isJunkStoreLine(s) {
   var flatAll = s.replace(/\s/g, '');
   if (!/[ぁ-んァ-ヶ一-龯]/.test(flatAll) && /\d/.test(flatAll) &&
       /[A-Za-z]/.test(flatAll) && !/\s/.test(s.trim())) return true;
+  /* v1.14: fragmento minúsculo com dígito ("6 こつ" — o que sobrou
+     do logo do Shake Shack na passada principal, 2026-11-22) não é
+     nome de loja: juntando tudo tem ≤4 caracteres, tem dígito e
+     nenhuma sequência de 3+ kana/kanji/letras. A guarda de linha
+     fragmentada exige 3+ tokens e não pegava o caso de 2 tokens. */
+  if (flatAll.length <= 4 && /\d/.test(flatAll) &&
+      !/[ぁ-んァ-ヶ一-龯]{3,}/.test(flatAll) && !/[A-Za-z]{3,}/.test(flatAll)) return true;
   return false;
 }
 
