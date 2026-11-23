@@ -71,7 +71,28 @@
 'use strict';
 
 /* ============ Constantes ============ */
-var APP_VERSION = '1.14';
+/* v1.15 (2026-11-23): qualidade da LEITURA (a extração não muda).
+   Três recibos reais do dia salvaram ¥0 com nome lixo, com fotos
+   perfeitamente legíveis: a causa raiz era a caixa do papel — sobre
+   mesa CLARA, detectPaperBoxes escolhia a mesa vazia em vez do
+   papel, e TODAS as passadas (e o resgate) nasciam do recorte
+   errado. Correções:
+   1. Rede de segurança em QUADRO INTEIRO: quando nem as passadas
+      clássicas nem o resgate acham total, entram passadas sobre a
+      foto inteira — cinza PSM 4/6, binarizada (Otsu) PSM 6, metade
+      dos totais binarizada e PSM 11 — sem depender da caixa. (Só
+      sem total: com total achado, passada a mais já regrediu um
+      caso bom — Seven 1,060 lido "1,080" por UMA passada nova.)
+   2. makeOcrVariant ganha binarização Otsu opcional (resgata a
+      letra miúda do Ito-Yokado fotografado de longe).
+   3. Foto NOVA: o OCR lê uma cópia de até 3000px do arquivo
+      original; a foto guardada continua em 1200px (armazenamento).
+   4. Botão "Reler foto" no detalhe: relê a foto guardada com o
+      pipeline novo e atualiza só os campos que a leitura achou.
+   5. CHAIN_NAMES: オフハウス e イトーヨーカドー (as duas lojas dos
+      recibos quebrados; mesmo padrão da v1.14 com o Shake Shack).
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.15.md. */
+var APP_VERSION = '1.15';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -672,6 +693,26 @@ function extractMoney(rawText) {
     /* Sem subtotal aproveitável: a soma das bases 対象 é o total
        (taxa única: a própria base; duas taxas: a soma delas). */
     var tsh = scanTaishou(lines);
+    /* v1.15: base-fragmento — quando a 1ª casa da base sai lida
+       como kanji ("8%対象額 X,129"), a cauda (129) entra como base
+       separada e a soma FABRICA um total que não está no papel
+       (129 + 4.129 = 4.258, Ito-Yokado 2026-11-23, com o 4.129
+       impresso e ancorado no mesmo texto). Se um valor é a cauda
+       decimal de outro (129 = 4.129 mod 1000) e a soma NÃO aparece
+       impressa numa linha de 計, a cauda é pedaço da base maior e
+       sai da soma. Se a soma está impressa, vale a soma (recibo de
+       duas taxas de verdade). A aritmética não cria valor: só para
+       de somar o que é fragmento do mesmo número. */
+    if (tsh.length >= 2) {
+      var sumAll = tsh.reduce(function (s0, v0) { return s0 + v0; }, 0);
+      if (!totalPrintedOnKeLine(lines, sumAll)) {
+        tsh = tsh.filter(function (v) {
+          return !tsh.some(function (w) {
+            return w > v && w % Math.pow(10, String(v).length) === v;
+          });
+        });
+      }
+    }
     if (tsh.length) {
       var tsum = tsh.reduce(function (s3, v3) { return s3 + v3; }, 0);
       if (tsum >= 100 && (!sub || !sub.taxExcluded || tsum > sub.value)) {
@@ -1008,7 +1049,12 @@ var CHAIN_NAMES = [
   ['はま寿司', 'はま寿司'], ['かっぱ寿司', 'かっぱ寿司'],
   ['日高屋', '日高屋'], ['コメダ珈琲', 'コメダ珈琲'],
   ['スターバックス', 'スターバックス'], ['ドトール', 'ドトール'],
-  ['タリーズコーヒー', 'タリーズコーヒー'], ['タリーズ', 'タリーズコーヒー']
+  ['タリーズコーヒー', 'タリーズコーヒー'], ['タリーズ', 'タリーズコーヒー'],
+  /* v1.15: as duas lojas dos recibos de 2026-11-23 que salvaram
+     com nome lixo — o texto do OCR traz o nome (com espaços, que a
+     normalização remove), mas a rede não estava no mapa. */
+  ['オフハウス', 'オフハウス'], ['OFF HOUSE', 'オフハウス'], ['OFFHOUSE', 'オフハウス'],
+  ['イトーヨーカドー', 'イトーヨーカドー'], ['ヨーカドー', 'イトーヨーカドー']
 ];
 
 /* Linhas que nunca são o nome da loja: cabeçalhos de recibo, telefone,
@@ -1849,7 +1895,56 @@ function renderDetail(id) {
     tp.classList.remove('hidden');
     tp.textContent = it.paid ? 'Desmarcar como paga' : '✔ Marcar como paga';
   } else tp.classList.add('hidden');
+
+  /* v1.15: "Reler foto" só faz sentido com foto guardada. (Com
+     guarda, igual às seções acima: HTML antigo em cache não quebra
+     o detalhe — só não mostra o botão.) */
+  var rb = $('btnReread');
+  if (rb) rb.classList.toggle('hidden', !it.photo);
   showView('detail');
+}
+
+/* v1.15: relê a foto GUARDADA do item com o pipeline atual e
+   atualiza os campos — conserta item salvo por uma leitura ruim
+   (ex.: os 3 recibos de 2026-11-23, ¥0 e nome lixo) sem precisar
+   fotografar de novo. Fidelidade: só sobrescreve o que a nova
+   leitura ACHOU; o que ela não achou fica como estava — e o tipo,
+   a foto, a data da foto, pago/nota/link nunca mudam. */
+function rereadCurrentPhoto() {
+  var it = items.find(function (x) { return x.id === currentDetailId; });
+  if (!it || !it.photo) return;
+  if (typeof Tesseract === 'undefined' || !Tesseract.createWorker) {
+    toast('Leitura indisponível agora — conecte-se uma vez pra baixar o leitor.');
+    return;
+  }
+  var btn = $('btnReread');
+  var label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '🔄 Lendo a foto… pode demorar'; }
+  prepareAndOcr(it.photo).then(function (text) {
+    var data = extractFromText(text || '');
+    var datesFound = findAllDates(normalizeOcr(text || ''));
+    if (data.store) { it.store = data.store; it.place = data.place; it.branch = data.branch; }
+    if (data.phone) it.phone = data.phone;
+    if (datesFound.length) it.date = data.date;
+    /* Total < ¥100 é fragmento, não total (mesmo critério da guarda
+       anti-lixo da v1.8 pra entregue/troco): uma releitura fraca
+       não pode trocar o "não lido" por um valor fabricado. */
+    if (data.amount != null && data.amount >= 100) it.amount = data.amount;
+    if (data.tendered != null) it.tendered = data.tendered;
+    if (data.change != null) it.change = data.change;
+    if (data.dueDate) it.dueDate = data.dueDate;
+    if (data.validUntil) it.validUntil = data.validUntil;
+    if (data.category && data.category !== 'Outros') it.category = data.category;
+    if (text) it.ocrText = text;
+    saveItems(items);
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    renderDetail(it.id);
+    toast('Foto relida: ' + (it.store || 'loja não lida') +
+      (it.amount != null && it.amount > 0 ? ' · ' + fmtYen(it.amount) : ' · valor não lido'));
+  }).catch(function () {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    toast('Não consegui reler a foto.');
+  });
 }
 
 /* ============ Edição (opcional, depois de salvar) ============ */
@@ -1999,6 +2094,34 @@ function downscaleImage(file, cb) {
   img.onerror = function () { URL.revokeObjectURL(url); toast('Não consegui abrir essa imagem.'); };
   img.src = url;
 }
+
+/* v1.15: cópia SÓ pra leitura (OCR), bem maior que a foto guardada.
+   A foto salva continua em 1200px (limite do armazenamento local),
+   mas recibo comprido fotografado de longe — letra miúda, como o
+   Ito-Yokado de 2026-11-23 — some na versão de 1200px; o OCR lê
+   esta cópia de até 3000px feita do arquivo original. Devolve null
+   quando a foto já é pequena (a guardada serve de fonte). */
+var OCR_SOURCE_MAX = 3000;
+function makeOcrSource(file, cb) {
+  var url;
+  try { url = URL.createObjectURL(file); } catch (e) { cb(null); return; }
+  var img = new Image();
+  img.onload = function () {
+    try {
+      var w = img.naturalWidth, h = img.naturalHeight;
+      var scale = Math.min(1, OCR_SOURCE_MAX / Math.max(w, h));
+      if (!w || !h || scale >= 0.99) { URL.revokeObjectURL(url); cb(null); return; }
+      var cv = document.createElement('canvas');
+      cv.width = Math.round(w * scale);
+      cv.height = Math.round(h * scale);
+      cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+      URL.revokeObjectURL(url);
+      cb(cv.toDataURL('image/jpeg', 0.85));
+    } catch (e) { URL.revokeObjectURL(url); cb(null); }
+  };
+  img.onerror = function () { URL.revokeObjectURL(url); cb(null); };
+  img.src = url;
+}
 /* ============ Preparação da foto pro OCR (v1.5) ============
    A foto crua reprova: o recibo é uma faixa clara e estreita sobre
    um fundo escuro e texturizado, e o Tesseract perde a segmentação
@@ -2078,8 +2201,11 @@ function detectPaperBoxes(img) {
 }
 
 /* Desenha o recorte em cinza, com contraste esticado (mín/máx) e
-   borda branca, escalado pra largura alvo (altura máx. 3600px). */
-function makeOcrVariant(img, box, targetW) {
+   borda branca, escalado pra largura alvo (altura máx. 3600px).
+   v1.15: com `binarize`, aplica limiar de Otsu depois do contraste
+   (preto/branco puros) — em letra miúda ou térmica desbotada, o
+   motor lê a versão binarizada onde a cinza falha. */
+function makeOcrVariant(img, box, targetW, binarize) {
   var scale = targetW / box.w;
   if (box.h * scale > 3600) scale = 3600 / box.h;
   var w = Math.max(50, Math.round(box.w * scale));
@@ -2104,6 +2230,26 @@ function makeOcrVariant(img, box, targetW) {
     var v = d[i];
     if (range >= 30) v = Math.max(0, Math.min(255, (v - mn) * 255 / range));
     d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  if (binarize) {
+    var hist = [], totalPx = 0, sumPx = 0, t2;
+    for (t2 = 0; t2 < 256; t2++) hist[t2] = 0;
+    for (i = 0; i < d.length; i += 4) { hist[d[i]]++; totalPx++; sumPx += d[i]; }
+    var sumB = 0, wB = 0, bestVar = -1, thr = 127;
+    for (t2 = 0; t2 < 256; t2++) {
+      wB += hist[t2];
+      if (!wB) continue;
+      var wF = totalPx - wB;
+      if (!wF) break;
+      sumB += t2 * hist[t2];
+      var mB = sumB / wB, mF = (sumPx - sumB) / wF;
+      var between = wB * wF * (mB - mF) * (mB - mF);
+      if (between > bestVar) { bestVar = between; thr = t2; }
+    }
+    for (i = 0; i < d.length; i += 4) {
+      var bv = d[i] > thr ? 255 : 0;
+      d[i] = d[i + 1] = d[i + 2] = bv;
+    }
   }
   cx.putImageData(id, 0, 0);
   return cv.toDataURL('image/jpeg', 0.9);
@@ -2152,6 +2298,29 @@ function hasTotalsMarkers(text) {
   return /合計|小計|対象|預|釣|税/.test(String(text || '').replace(/\s/g, ''));
 }
 
+/* v1.15: nota de qualidade do texto lido — quantos sinais de recibo
+   de verdade ele carrega (marcadores de totais, valores com ¥,
+   densidade de dígitos, telefone, data). DIAGNÓSTICO: a primeira
+   versão da v1.15 usava a nota pra disparar a rede em quadro
+   inteiro mesmo com total achado, e isso regrediu um caso bom
+   (Seven 1,060 → 1,080); a rede final só roda sem total nenhum.
+   A nota fica como medida objetiva nos diagnósticos (bom ≥ 20,
+   quebrado ≈ 0). */
+function scoreOcrText(text) {
+  if (!text) return 0;
+  var t = String(text).replace(/\s/g, ''), s = 0, i;
+  var markers = ['合計', '小計', 'お買上計', '買上計', '対象額', '対象',
+    '内税', '消費税', 'お預り', '預り', 'お釣り', '釣り', '領収'];
+  for (i = 0; i < markers.length; i++) if (t.indexOf(markers[i]) >= 0) s += 3;
+  var amounts = t.match(/[¥￥\\][0-9][0-9,]{1,}/g);
+  if (amounts) s += Math.min(amounts.length, 6) * 2;
+  var digits = t.replace(/[^0-9]/g, '').length;
+  s += Math.min(Math.floor(digits / 25), 8);
+  if (/0\d{1,4}-\d{2,4}-\d{3,4}/.test(t)) s += 3;
+  if (/\d{4}[年\/\-]\d{1,2}[月\/\-]\d{1,2}/.test(t)) s += 3;
+  return s;
+}
+
 /* Passadas de RESGATE (v1.8): a foto nova da Saizeriya — reta, bem
    iluminada — rendeu só 273 caracteres nas passadas A–D: a zona de
    totais não foi lida em nenhuma escala/PSM delas. O resgate relê
@@ -2178,6 +2347,31 @@ function rescueVariants(img, boxes) {
     { img: makeOcrVariant(img, totals, 2200), psm: '6' },
     { img: makeOcrVariant(img, totals, 1100), psm: '6' },
     { img: makeOcrVariant(img, zone(0.12, 0.52), 2000), psm: '6' }
+  ];
+}
+
+/* Rede de segurança em QUADRO INTEIRO (v1.15): todas as variantes
+   acima nascem da caixa do papel — se a detecção erra (mesa clara:
+   a maior faixa brilhante é a mesa vazia, não o recibo), passadas e
+   resgate leem o recorte errado e o texto sai 100% lixo, como nos
+   recibos de 2026-11-23 (Ito-Yokado e OFF HOUSE: ¥0, nome lixo).
+   Estas variantes ignoram a caixa: a foto inteira em cinza (PSM 4
+   e 6), binarizada Otsu (PSM 6), a metade dos totais da foto
+   inteira binarizada e uma esparsa (PSM 11, formato 領収証).
+   Entram junto do resgate clássico; a extração — que só aceita
+   valor ancorado — escolhe o que presta no texto combinado. */
+function fullFrameRescueVariants(img) {
+  var full = { x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight };
+  var totalsFull = {
+    x: 0, y: Math.round(full.h * 0.35),
+    w: full.w, h: full.h - Math.round(full.h * 0.35)
+  };
+  return [
+    { img: makeOcrVariant(img, full, 1600), psm: '4' },
+    { img: makeOcrVariant(img, full, 1600), psm: '6' },
+    { img: makeOcrVariant(img, full, 1600, true), psm: '6' },
+    { img: makeOcrVariant(img, totalsFull, 1800, true), psm: '6' },
+    { img: makeOcrVariant(img, full, 1600, true), psm: '11' }
   ];
 }
 
@@ -2223,11 +2417,28 @@ function prepareAndOcr(dataUrl) {
       return ocrPasses(rescueVariants(img, boxes), null).then(function (t) {
         return merged + '\n' + t;
       }, function () { return merged; });
+    }).then(function (merged) {
+      /* v1.15: rede em quadro inteiro — SÓ quando nem as passadas
+         clássicas nem o resgate acharam total nenhum. A primeira
+         versão rodava a rede também com total achado e texto
+         "fraco" (scoreOcrText) e REGREDIU um caso bom: no Seven, a
+         passada nova leu o total 1,060 como "合計 \1.080" (6→8) e o
+         valor errado venceu o certo, ancorado em 3 linhas do texto
+         clássico. Sem total nenhum, o risco inverte: leitura a mais
+         é bem-vinda, porque a extração só aceita valor ancorado. */
+      if (extractMoney(merged).amount !== null) return merged;
+      $('ocrStatus').textContent = 'Lendo a foto… tentando o quadro inteiro';
+      return ocrPasses(fullFrameRescueVariants(img), null).then(function (t) {
+        return merged + '\n' + t;
+      }, function () { return merged; });
     });
   });
 }
 
-function runOCR(dataUrl) {
+/* dataUrl = foto GUARDADA (1200px); ocrDataUrl = cópia grande só
+   pra leitura (v1.15) — o item salva sempre a guardada. */
+function runOCR(dataUrl, ocrDataUrl) {
+  var ocrSrc = ocrDataUrl || dataUrl;
   var box = $('ocrBox');
   box.classList.remove('hidden');
   $('ocrStatus').textContent = 'Preparando a foto…';
@@ -2237,15 +2448,20 @@ function runOCR(dataUrl) {
     saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros', photoAt: pendingPhotoAt }, dataUrl, '');
     return;
   }
-  prepareAndOcr(dataUrl).then(function (text) {
+  prepareAndOcr(ocrSrc).then(function (text) {
     box.classList.add('hidden');
     var data = extractFromText(text);
+    /* v1.15: total < ¥100 vindo de leitura fracassada é fragmento
+       (um dígito solto numa linha de 合計 destruída — a Saizeriya
+       desbotada de 2026-11-23 rendeu "7"), não total: fica "não
+       lido", como manda a regra de nunca inventar valor. */
+    if (data.amount != null && data.amount < 100) data.amount = null;
     data.photoAt = pendingPhotoAt;
     data.ocrText = text;
     saveExtractedItem(data, dataUrl, '');
   }).catch(function () {
     /* Plano B: leitura simples, como era antes da v1.5. */
-    Tesseract.recognize(dataUrl, 'jpn', {
+    Tesseract.recognize(ocrSrc, 'jpn', {
       logger: function (m) {
         if (m.status === 'recognizing text') {
           $('ocrBar').style.width = Math.round(m.progress * 100) + '%';
@@ -2256,6 +2472,7 @@ function runOCR(dataUrl) {
       box.classList.add('hidden');
       var text = (res && res.data && res.data.text) || '';
       var data = extractFromText(text);
+      if (data.amount != null && data.amount < 100) data.amount = null;
       data.photoAt = pendingPhotoAt;
       data.ocrText = text;
       saveExtractedItem(data, dataUrl, '');
@@ -2270,7 +2487,11 @@ function handlePhotoFile(file) {
   /* EXIF primeiro: o downscale (canvas) apaga os metadados. */
   readPhotoAt(file, function (photoAt) {
     pendingPhotoAt = photoAt;
-    downscaleImage(file, function (dataUrl) { runOCR(dataUrl); });
+    downscaleImage(file, function (dataUrl) {
+      /* v1.15: o OCR lê a cópia grande do arquivo original; o item
+         guarda a foto de 1200px de sempre. */
+      makeOcrSource(file, function (ocrSrc) { runOCR(dataUrl, ocrSrc); });
+    });
   });
 }
 
@@ -2627,6 +2848,9 @@ function bindEvents() {
     toast(it.paid ? 'Conta marcada como paga ✔' : 'Conta marcada como a pagar.');
     renderDetail(currentDetailId);
   };
+  /* v1.15 (com guarda: HTML antigo em cache não tem o botão). */
+  var btnRereadEl = $('btnReread');
+  if (btnRereadEl) btnRereadEl.onclick = function () { rereadCurrentPhoto(); };
 
   $('btnExport').onclick = exportBackup;
   $('btnImport').onclick = function () { $('fileImport').click(); };
