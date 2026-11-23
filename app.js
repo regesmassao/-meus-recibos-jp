@@ -91,8 +91,23 @@
       pipeline novo e atualiza só os campos que a leitura achou.
    5. CHAIN_NAMES: オフハウス e イトーヨーカドー (as duas lojas dos
       recibos quebrados; mesmo padrão da v1.14 com o Shake Shack).
-   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.15.md. */
-var APP_VERSION = '1.15';
+   Diagnóstico completo em test-ocr/DIAGNOSTICO-v1.15.md.
+   v1.16 (2026-11-24): o dígito perdido — dois recibos de 23/11
+   perderam o 1º dígito do total no OCR ("15,754" saiu "5,754";
+   "2,060" saiu ",060" → ¥0). Correções, só extração (nenhuma
+   passada nova de OCR): (1) total < ¥100 passa a valer "sem
+   total" já dentro da extração, pra os caminhos de resgate
+   poderem rodar (o resgate do pipeline também dispara com total
+   < ¥100, não só com total nulo); (2) reconciliação pelo
+   pagamento — entregue − troco rotulados fechando num valor
+   impresso que tem o total atual como cauda decimal corrige o
+   total (Costco: 20.000 − 4.246 = 15.754); (3) reconstrução da
+   cauda pelo imposto — a mesma cauda ",060" em ≥ 2 linhas
+   rotuladas + um único dígito inicial que fecha com o imposto
+   impresso (2.060 → ¥187 a 10%) devolve o total; (4) "売上"
+   não é mais aceito como nome da loja (é palavra de documento,
+   como 領収書). Diagnóstico em test-ocr/DIAGNOSTICO-v1.16.md. */
+var APP_VERSION = '1.16';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -622,6 +637,60 @@ function repeatedTaxTotal(lines) {
   return found.length === 1 ? found[0] : null;
 }
 
+/* v1.16: total reconstruído a partir da cauda — o OCR perde o 1º
+   dígito do total ("2,060" sai ",060") e o valor some (< ¥100,
+   bloqueado como fragmento). A cauda sozinha não diz o dígito:
+   ele vem do imposto impresso. Fecha quando: (1) a mesma cauda
+   de 3 dígitos aparece em ≥ 2 linhas rotuladas de dinheiro
+   (小計/合計/対象計/お預り/領収金額/現金); (2) exatamente UM
+   dígito inicial d (1–9) faz V = d×1000 + cauda ter o imposto
+   impresso (floor(V×10/110) ou floor(V×8/108) numa linha de 税);
+   (3) V não é um imposto lido. A aritmética só desempata entre
+   valores que o papel sustenta — o dígito vem do imposto, não
+   do chute. Sem imposto impresso, ou com dois dígitos possíveis,
+   não chuta (null). */
+function fragmentTaxTotal(lines) {
+  var labels = ['合計', '小計', '対象計', 'お預り', '預り', '領収金額', '現金'];
+  var tails = {}, order = [];
+  for (var i = 0; i < lines.length; i++) {
+    var st = lines[i].replace(/\s/g, '');
+    var labeled = false;
+    for (var k = 0; k < labels.length; k++) {
+      if (st.indexOf(labels[k]) >= 0) { labeled = true; break; }
+    }
+    if (!labeled) continue;
+    var re = /(^|[^0-9])[.,](\d{3})(?!\d)/g, m;
+    while ((m = re.exec(lines[i])) !== null) {
+      var tail = m[2];
+      if (!tails[tail]) { tails[tail] = 0; order.push(tail); }
+      tails[tail]++;
+    }
+  }
+  var taxSet = {};
+  for (var j = 0; j < lines.length; j++) {
+    if (lines[j].indexOf('税') < 0) continue;
+    numbersInLineFuzzy(stripRates(lines[j])).forEach(function (v) {
+      if (v >= 20) taxSet[v] = true;
+    });
+  }
+  if (!Object.keys(taxSet).length) return null;
+  var found = [];
+  for (var t = 0; t < order.length; t++) {
+    var tailStr = order[t];
+    if (tails[tailStr] < 2) continue;
+    var tailNum = parseInt(tailStr, 10);
+    for (var d = 1; d <= 9; d++) {
+      var v = d * 1000 + tailNum;
+      if (taxSet[v]) continue;
+      var okTax = taxSet[Math.floor(v * 10 / 110)] ||
+        taxSet[Math.floor(v * 8 / 108)];
+      if (!okTax) continue;
+      if (found.indexOf(v) < 0) found.push(v);
+    }
+  }
+  return found.length === 1 ? found[0] : null;
+}
+
 /* Extrai total, valor entregue (お預かり) e troco (お釣り) do texto.
    tendered/change ficam null quando não aparecem no papel.
    v1.5: total também via 小計 e, em último caso, via um 計 solto;
@@ -770,6 +839,15 @@ function extractMoney(rawText) {
     amount = maxE;
   }
 
+  /* v1.16: total < ¥100 é fragmento, não total — o runOCR já o
+     descarta ao salvar, mas aqui ele é descartado ANTES de
+     resolver entregue/troco, pra os caminhos de "sem total"
+     (fechamento pela zona de pagamento, repetição+imposto e
+     reconstrução da cauda) poderem rodar sobre a evidência
+     real. Um total legítimo < ¥100 não existe na prática e o
+     app nunca o persistiria mesmo. */
+  if (amount !== null && amount < 100) amount = null;
+
   var tenderedKw = moneyByKeywords(lines, TENDERED_KEYWORDS);
   var changeKw = moneyByKeywords(lines, CHANGE_KEYWORDS);
   /* v1.8: guarda anti-lixo — entregue/troco < ¥100 vindo de linha
@@ -909,6 +987,53 @@ function extractMoney(rawText) {
     if (rt !== null) amount = rt;
   }
 
+  /* v1.16: reconstrução da cauda pelo imposto (fragmentTaxTotal)
+     — o caso da Saizeriya desbotada de 2026-11-23: o total saiu
+     ",060" em todas as linhas rotuladas e só o imposto (¥187)
+     sobreviveu inteiro. */
+  if (amount === null) {
+    var ft = fragmentTaxTotal(lines);
+    if (ft !== null) amount = ft;
+  }
+
+  /* v1.16: reconciliação pelo pagamento — o OCR perde o 1º dígito
+     do total ("15,754" sai "5,754") e o valor errado passa em
+     todos os caminhos, mas o papel também traz o entregue e o
+     troco rotulados, e a conta entregue − troco = total fecha num
+     valor IMPRESSO que tem o total atual como cauda decimal exata.
+     Corrige só com as três evidências juntas: (1) troco C vem de
+     linha rotulada (お釣り/釣銭); (2) entregue T está impresso
+     (resolvido ou na linha 現金/お預り); (3) V = T − C está
+     impresso no texto e tem o total atual como cauda (a assinatura
+     da perda do 1º dígito). Sem as três, nada muda — e se dois
+     entregues diferentes fecharem valores diferentes, é ambíguo:
+     não chuta. */
+  if (amount !== null && amount >= 100 && change !== null && change > 0) {
+    var changeAnchored16 = moneyByKeywords(lines, CHANGE_KEYWORDS) === change;
+    if (changeAnchored16) {
+      var tCands16 = [];
+      if (tendered !== null) tCands16.push(tendered);
+      var cashKw16 = moneyByKeywords(lines, TENDERED_KEYWORDS.concat(['現金']));
+      if (cashKw16 !== null && tCands16.indexOf(cashKw16) < 0) tCands16.push(cashKw16);
+      var fixed16 = [], fixedT16 = [];
+      for (var ti16 = 0; ti16 < tCands16.length; ti16++) {
+        var t16 = tCands16[ti16];
+        if (t16 === null || t16 <= change) continue;
+        if (countValueOccurrences(lines, t16).count < 1) continue;
+        var v16 = t16 - change;
+        if (v16 < 100 || v16 === amount) continue;
+        if (String(v16).length <= String(amount).length) continue;
+        if (String(v16).slice(-String(amount).length) !== String(amount)) continue;
+        if (countValueOccurrences(lines, v16).count < 1) continue;
+        if (fixed16.indexOf(v16) < 0) { fixed16.push(v16); fixedT16.push(t16); }
+      }
+      if (fixed16.length === 1) {
+        amount = fixed16[0];
+        if (tendered === null) tendered = fixedT16[0];
+      }
+    }
+  }
+
   return { amount: amount, tendered: tendered, change: change };
 }
 
@@ -921,6 +1046,13 @@ function classifyType(text) {
   for (var i = 0; i < CONTA_KEYWORDS.length; i++) {
     if (t.indexOf(CONTA_KEYWORDS[i]) >= 0) return 'conta';
   }
+  /* v1.16: papel com cara de recibo (合計/小計/領収/お預り/お釣り/
+     消費税/税率/登録番号) é recibo mesmo que traga palavra de
+     promoção — "ホールセール" (Costco) contém セール e caía em
+     promoção, tirando a compra do gasto do mês; e "割引" aparece
+     em rodapé de recibo comum (Ito-Yokado). A checagem de promoção
+     só vale pro papel sem cara de recibo. */
+  if (/合計|小計|領収|お預|お釣|釣銭|消費税|税率|登録番号/.test(t.replace(/\s/g, ''))) return 'recibo';
   for (var j = 0; j < PROMO_KEYWORDS.length; j++) {
     if (t.indexOf(PROMO_KEYWORDS[j]) >= 0) return 'promocao';
   }
@@ -1061,6 +1193,10 @@ var CHAIN_NAMES = [
    endereço postal, datas, linhas só de números e a linha do total. */
 function isJunkStoreLine(s) {
   if (/領収書|領収証|レシート|いらっしゃいませ|ありがとう/.test(s)) return true;
+  /* v1.16: "売上" (e "売上高") é palavra de documento, não nome
+     de loja — no Costco de 2026-11-23 ela virou o "nome" porque o
+     cabeçalho COSTCO é gráfico e o rodapé não foi lido. */
+  if (/売上/.test(s)) return true;
   /* v1.12: linha com "#" (店舗 # 0005, レシート # 410178) é linha
      de número/terminal, e linha com ¥/\ é linha de dinheiro ou
      item ("SE1 CorOona EXtra \OoOU") — nenhuma das duas é o nome
@@ -1168,7 +1304,10 @@ function extractPhone(rawText) {
   var text = normalizeOcr(rawText);
   var patterns = [
     /0120[- ]\d{3}[- ]\d{3}/,
-    /0\d{1,4}[- ]\d{1,4}[- ]\d{4}/
+    /* v1.16: o grupo final pode ter 3 dígitos — o 0570 do Costco
+       ("0570-200-800") não casava com \d{4} e caía no caminho
+       tolerante, que devolvia outro número. */
+    /0\d{1,4}[- ]\d{1,4}[- ]\d{3,4}/
   ];
   for (var i = 0; i < patterns.length; i++) {
     var m = patterns[i].exec(text);
@@ -2410,7 +2549,12 @@ function prepareAndOcr(dataUrl) {
         return merged + '\n' + t;
       }, function () { return merged; });
     }).then(function (merged) {
-      if (hasTotalsMarkers(merged) && extractMoney(merged).amount !== null) {
+      /* v1.16: total < ¥100 é fragmento (a v1.15 já o descarta ao
+         salvar) — aqui ele também conta como "sem total", pra o
+         resgate rodar. Com total plausível achado, o resgate
+         continua suprimido (a lição do Seven 1,060 → 1,080). */
+      var amtRescue = extractMoney(merged).amount;
+      if (hasTotalsMarkers(merged) && amtRescue !== null && amtRescue >= 100) {
         return merged;
       }
       $('ocrStatus').textContent = 'Lendo a foto… parte extra (totais)';
@@ -2425,8 +2569,10 @@ function prepareAndOcr(dataUrl) {
          passada nova leu o total 1,060 como "合計 \1.080" (6→8) e o
          valor errado venceu o certo, ancorado em 3 linhas do texto
          clássico. Sem total nenhum, o risco inverte: leitura a mais
-         é bem-vinda, porque a extração só aceita valor ancorado. */
-      if (extractMoney(merged).amount !== null) return merged;
+         é bem-vinda, porque a extração só aceita valor ancorado.
+         v1.16: total < ¥100 conta como sem total (fragmento). */
+      var amtFull16 = extractMoney(merged).amount;
+      if (amtFull16 !== null && amtFull16 >= 100) return merged;
       $('ocrStatus').textContent = 'Lendo a foto… tentando o quadro inteiro';
       return ocrPasses(fullFrameRescueVariants(img), null).then(function (t) {
         return merged + '\n' + t;
