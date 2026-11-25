@@ -107,7 +107,7 @@
    impresso (2.060 → ¥187 a 10%) devolve o total; (4) "売上"
    não é mais aceito como nome da loja (é palavra de documento,
    como 領収書). Diagnóstico em test-ocr/DIAGNOSTICO-v1.16.md. */
-var APP_VERSION = '1.16';
+var APP_VERSION = '1.17';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -2793,6 +2793,50 @@ function driveSaveConfig() {
   driveSetStatus('✔️ Link e chave salvos neste aparelho.');
   driveCheckOnOpen();
 }
+/* Salro Link (v1.17): texto de conexão que o dono cola no assistente
+   dele (Muse), pra ele ler e lançar neste app pela mesma ponte. */
+function linkPromptText(url, key) {
+  return [
+    'Você agora está conectado ao meu app Salro Recibos (Meus Recibos JP) (padrão Salro Link). Meus dados ficam numa ponte na nuvem, no meu próprio Google Drive:',
+    '- Link da ponte: ' + url,
+    '- Chave: ' + key,
+    '',
+    'COMO LER: faça GET em "' + url + '?action=read&key=' + key + '". A resposta é um JSON {ok, exists, updatedAt, data} — dentro de data vem o backup do app: {app: "recibos-jp", version, exportedAt, items}. items é a lista de registros: cada item é um recibo, uma conta com vencimento ou uma promoção fotografada, com a data do recibo (date), a data da foto (photoAt), o valor total, o local, a categoria e, nas contas, o vencimento (dueDate).',
+    'COMO ESCREVER: primeiro leia o estado atual; aplique a alteração sobre ele; depois faça POST em "' + url + '?action=write&key=' + key + '" com o backup COMPLETO atualizado (corpo JSON, content-type text/plain). Nunca envie um backup parcial — a escrita substitui o arquivo inteiro. Confirme a escrita com um novo GET e compare o que voltou.',
+    '',
+    'REGRAS DE SEGURANÇA (obrigatórias):',
+    '1. Nunca sobrescreva um backup com MENOS itens do que o que você leu, sem me avisar antes.',
+    '2. Ao juntar dados, una pelos IDs dos itens — nunca apague um item que você não criou.',
+    '3. Nunca mostre a minha chave em respostas, arquivos ou registros; ela é uma senha.',
+    '4. Os registros são fiéis ao recibo: a data principal é a data DO RECIBO (a data da foto fica separada, em photoAt). O que não der para ler com segurança fica em branco, nunca inventado — e nunca salve um subtotal sem imposto como se fosse o total.',
+    '5. Valores em ienes (¥) e em reais (R$) sempre separados; se converter, diga a taxa usada.',
+    '',
+    'Para confirmar que entendeu: leia a ponte agora e me diga quantos itens encontrou, de que período eles são e quais contas estão para vencer.'
+  ].join('\n');
+}
+function linkCopyText() {
+  var st = $('linkStatus');
+  var c = driveConfig();
+  if (!c.url || !c.key) {
+    if (st) st.textContent = 'Configure a nuvem acima primeiro: cole o link e a chave da ponte e toque em Salvar link e chave.';
+    return;
+  }
+  var text = linkPromptText(c.url, c.key);
+  var done = function () { if (st) st.textContent = 'Texto de conexão copiado ✔ Agora é só colar numa conversa com o seu Muse.'; };
+  var fallback = function () {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); }
+    catch (e) { if (st) st.textContent = 'Não consegui copiar automaticamente. Tente de novo.'; }
+    ta.remove();
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else fallback();
+}
 function driveFetchJson(url, options) {
   var p;
   try { p = fetch(url, options); } catch (e) { p = Promise.reject(e); }
@@ -3003,6 +3047,7 @@ function bindEvents() {
   $('fileImport').onchange = function () { if (this.files[0]) importBackup(this.files[0]); this.value = ''; };
 
   $('driveSave').onclick = driveSaveConfig;
+  $('linkCopy').onclick = linkCopyText;
   $('driveUp').onclick = driveUpload;
   $('driveDown').onclick = driveDownload;
   $('driveNoticeClose').onclick = driveHideNotice;
