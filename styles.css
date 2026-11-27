@@ -135,6 +135,9 @@ label{display:block; font-size:13px; color:var(--muted); margin-bottom:5px}
 .barbtn:active{background:#f3eddc}
 .bar-sub{font-size:12px; color:var(--muted); margin-top:3px}
 .catbar-fill.place-fill{background:var(--navy)}
+/* v1.20: barra de DESPESAS (grupo somado de contas) na distribuição */
+.catbar-fill.bill-fill{background:var(--navy2)}
+.barbtn.bill-bar{cursor:default}
 .catbar-fill.month-fill{background:var(--green)}
 .barbtn.on-month .catbar-top span{font-weight:700}
 /* Lugares (v1.4) */
