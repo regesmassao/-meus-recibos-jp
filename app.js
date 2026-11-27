@@ -106,8 +106,16 @@
    rotuladas + um único dígito inicial que fecha com o imposto
    impresso (2.060 → ¥187 a 10%) devolve o total; (4) "売上"
    não é mais aceito como nome da loja (é palavra de documento,
-   como 領収書). Diagnóstico em test-ocr/DIAGNOSTICO-v1.16.md. */
-var APP_VERSION = '1.17';
+   como 領収書). Diagnóstico em test-ocr/DIAGNOSTICO-v1.16.md.
+   v1.18: botão "✨ Ler com IA" no detalhe do item, logo abaixo do
+   "Reler foto": manda a foto guardada pra ponte da nuvem (ação
+   "lerFoto"), que lê com o Gemini (IA de visão) e devolve os campos
+   estruturados. O resultado NÃO salva direto: abre a tela de revisão
+   de sempre, pra conferir antes de salvar. Se a ponte falhar, estiver
+   sem internet ou a IA ainda não estiver ativada na ponte, avisa e
+   cai pra leitura no aparelho (o "Reler foto" de sempre), sem travar.
+   A leitura no aparelho não muda em nada. */
+var APP_VERSION = '1.18';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -2040,6 +2048,9 @@ function renderDetail(id) {
      o detalhe — só não mostra o botão.) */
   var rb = $('btnReread');
   if (rb) rb.classList.toggle('hidden', !it.photo);
+  /* v1.18: "Ler com IA" segue a mesma regra do "Reler foto". */
+  var ab = $('btnReadAI');
+  if (ab) ab.classList.toggle('hidden', !it.photo);
   showView('detail');
 }
 
@@ -2083,6 +2094,104 @@ function rereadCurrentPhoto() {
   }).catch(function () {
     if (btn) { btn.disabled = false; btn.textContent = label; }
     toast('Não consegui reler a foto.');
+  });
+}
+
+/* ============ Leitura com IA (v1.18) ============
+   A foto guardada vai pra ponte da nuvem (ação "lerFoto"), que lê
+   com IA de visão (Gemini) e devolve os campos estruturados. Aqui
+   vale a mesma fidelidade de sempre: o que a IA não leu NÃO é
+   inventado — na revisão, o campo fica como já estava no item (ou
+   em branco); total < ¥100 é fragmento, não total. E nada salva
+   direto: o resultado abre a tela de revisão pra conferir. */
+
+function aiValidDate_(v) {
+  if (typeof v !== 'string') return null;
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v.trim());
+  if (!m) return null;
+  var y = +m[1], mo = +m[2], d = +m[3];
+  if (y < 1990 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  return m[1] + '-' + m[2] + '-' + m[3];
+}
+
+function aiNumOrNull_(v) {
+  var n = Number(v);
+  return (v !== null && v !== undefined && isFinite(n) && n >= 0) ? Math.round(n) : null;
+}
+
+/* Junta a leitura da IA com o item atual, no formato que a tela de
+   revisão entende. Campo que a IA não achou mantém o valor que o
+   item já tinha — igual ao "Reler foto": só sobrescreve o que a
+   nova leitura ACHOU. Função pura, testável. */
+function aiReadingToFormData(leitura, it) {
+  var l = leitura || {};
+  var total = aiNumOrNull_(l.total);
+  if (total !== null && total < 100) total = null; // fragmento, não total
+  var cat = CATEGORIES.indexOf(l.categoria_sugerida) >= 0 ? l.categoria_sugerida : null;
+  var tipo = ['recibo', 'conta', 'promocao'].indexOf(l.tipo) >= 0 ? l.tipo : null;
+  var loja = typeof l.loja === 'string' ? l.loja.trim() : '';
+  return {
+    type: tipo || (it ? it.type : 'recibo'),
+    date: aiValidDate_(l.data) || (it ? it.date : todayISO()),
+    store: loja || (it ? it.store : ''),
+    amount: total !== null ? total : (it && it.amount > 0 ? it.amount : null),
+    tendered: aiNumOrNull_(l.valor_pago) !== null ? aiNumOrNull_(l.valor_pago) : (it ? it.tendered : null),
+    change: aiNumOrNull_(l.troco) !== null ? aiNumOrNull_(l.troco) : (it ? it.change : null),
+    category: cat || (it ? it.category : 'Outros'),
+    dueDate: aiValidDate_(l.vencimento) || (it ? it.dueDate : null),
+    validUntil: aiValidDate_(l.valida_ate) || (it ? it.validUntil : null),
+    note: it ? (it.note || '') : ''
+  };
+}
+
+function aiReadCurrentPhoto() {
+  var it = items.find(function (x) { return x.id === currentDetailId; });
+  if (!it || !it.photo) return;
+  var c = driveConfig();
+  if (!c.url || !c.key) {
+    toast('Pra ler com IA, configure a ponte da nuvem (tela Backup).');
+    return;
+  }
+  var btn = $('btnReadAI');
+  var label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '✨ Lendo com IA… pode demorar'; }
+  var restore = function () { if (btn) { btn.disabled = false; btn.textContent = label; } };
+  /* Qualquer falha da ponte/IA: avisa curto e cai pra leitura no
+     aparelho (o "Reler foto"), sem travar o app. */
+  var fallback = function (msg) {
+    restore();
+    toast(msg);
+    rereadCurrentPhoto();
+  };
+  var b64 = it.photo;
+  var virgula = b64.indexOf(',');
+  if (virgula > 0) b64 = b64.slice(virgula + 1);
+  var p;
+  try {
+    p = fetch(driveApiUrl('lerFoto'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ foto: b64, mime: 'image/jpeg' })
+    });
+  } catch (e) { p = Promise.reject(e); }
+  p.then(function (res) {
+    return res.json().catch(function () { return null; });
+  }).then(function (body) {
+    if (!body || body.ok !== true || !body.leitura) {
+      if (body && body.error === 'sem_chave') {
+        fallback('A leitura por IA ainda não foi ativada na ponte. Usando a leitura do aparelho.');
+      } else if (body && body.error === 'unauthorized') {
+        fallback('❌ A ponte recusou a chave (confira em Backup → Nuvem). Usando a leitura do aparelho.');
+      } else {
+        fallback('A leitura por IA não respondeu. Usando a leitura do aparelho.');
+      }
+      return;
+    }
+    restore();
+    openReview(aiReadingToFormData(body.leitura, it), it.photo, it.link, it.id);
+    toast('Leitura por IA pronta — confira tudo antes de salvar.');
+  }).catch(function () {
+    fallback('Sem conexão com a ponte. Usando a leitura do aparelho.');
   });
 }
 
@@ -3041,6 +3150,9 @@ function bindEvents() {
   /* v1.15 (com guarda: HTML antigo em cache não tem o botão). */
   var btnRereadEl = $('btnReread');
   if (btnRereadEl) btnRereadEl.onclick = function () { rereadCurrentPhoto(); };
+  /* v1.18 (mesma guarda). */
+  var btnReadAIEl = $('btnReadAI');
+  if (btnReadAIEl) btnReadAIEl.onclick = function () { aiReadCurrentPhoto(); };
 
   $('btnExport').onclick = exportBackup;
   $('btnImport').onclick = function () { $('fileImport').click(); };
@@ -3126,6 +3238,7 @@ if (typeof module !== 'undefined' && module.exports) {
     sanitizeItem: sanitizeItem, CATEGORIES: CATEGORIES,
     buildBackupPayload: buildBackupPayload,
     APP_VERSION: APP_VERSION, renderVersionFooter: renderVersionFooter,
-    hasTotalsMarkers: hasTotalsMarkers
+    hasTotalsMarkers: hasTotalsMarkers,
+    aiReadingToFormData: aiReadingToFormData
   };
 }
