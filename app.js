@@ -114,8 +114,18 @@
    de sempre, pra conferir antes de salvar. Se a ponte falhar, estiver
    sem internet ou a IA ainda não estiver ativada na ponte, avisa e
    cai pra leitura no aparelho (o "Reler foto" de sempre), sem travar.
-   A leitura no aparelho não muda em nada. */
-var APP_VERSION = '1.18';
+   A leitura no aparelho não muda em nada.
+   v1.19: o MESMO "✨ Ler com IA" também na tela de revisão/cadastro
+   (botão btnReadAINew, logo abaixo da foto): com foto no formulário,
+   a primeira leitura já pode ser pela IA, sem precisar salvar e
+   abrir o item no histórico. A chamada à ponte virou a função única
+   callAiRead, usada pelos dois botões; o preenchimento continua
+   sendo aiReadingToFormData + openReview. Diferença de
+   comportamento: no cadastro, se a IA falhar, o formulário fica
+   EXATAMENTE como estava (a leitura do aparelho já feita continua
+   valendo) — não cai pro "Reler foto". O botão do detalhe continua
+   como estava, com o fallback de sempre. */
+var APP_VERSION = '1.19';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -2144,6 +2154,39 @@ function aiReadingToFormData(leitura, it) {
   };
 }
 
+/* Chamada ÚNICA à ponte (ação "lerFoto"), compartilhada pelo botão
+   do detalhe (v1.18) e pelo botão do cadastro (v1.19). Resolve com a
+   leitura da IA; rejeita com um Error com .code: o código de erro da
+   ponte (sem_chave, unauthorized, leitura_falhou…),
+   'resposta_invalida' quando a resposta não é uma leitura válida,
+   ou 'rede' quando nem a resposta chegou. Quem chama decide o que
+   fazer com a falha. */
+function callAiRead(photo) {
+  var b64 = photo;
+  var virgula = b64.indexOf(',');
+  if (virgula > 0) b64 = b64.slice(virgula + 1);
+  var p;
+  try {
+    p = fetch(driveApiUrl('lerFoto'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ foto: b64, mime: 'image/jpeg' })
+    });
+  } catch (e) { p = Promise.reject(e); }
+  return p.then(function (res) {
+    return res.json().catch(function () { return null; });
+  }).then(function (body) {
+    if (body && body.ok === true && body.leitura) return body.leitura;
+    var err = new Error('lerFoto');
+    err.code = body && body.error ? body.error : 'resposta_invalida';
+    throw err;
+  }, function () {
+    var err = new Error('lerFoto');
+    err.code = 'rede';
+    throw err;
+  });
+}
+
 function aiReadCurrentPhoto() {
   var it = items.find(function (x) { return x.id === currentDetailId; });
   if (!it || !it.photo) return;
@@ -2163,35 +2206,78 @@ function aiReadCurrentPhoto() {
     toast(msg);
     rereadCurrentPhoto();
   };
-  var b64 = it.photo;
-  var virgula = b64.indexOf(',');
-  if (virgula > 0) b64 = b64.slice(virgula + 1);
-  var p;
-  try {
-    p = fetch(driveApiUrl('lerFoto'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ foto: b64, mime: 'image/jpeg' })
-    });
-  } catch (e) { p = Promise.reject(e); }
-  p.then(function (res) {
-    return res.json().catch(function () { return null; });
-  }).then(function (body) {
-    if (!body || body.ok !== true || !body.leitura) {
-      if (body && body.error === 'sem_chave') {
-        fallback('A leitura por IA ainda não foi ativada na ponte. Usando a leitura do aparelho.');
-      } else if (body && body.error === 'unauthorized') {
-        fallback('❌ A ponte recusou a chave (confira em Backup → Nuvem). Usando a leitura do aparelho.');
-      } else {
-        fallback('A leitura por IA não respondeu. Usando a leitura do aparelho.');
-      }
-      return;
-    }
+  callAiRead(it.photo).then(function (leitura) {
     restore();
-    openReview(aiReadingToFormData(body.leitura, it), it.photo, it.link, it.id);
+    openReview(aiReadingToFormData(leitura, it), it.photo, it.link, it.id);
     toast('Leitura por IA pronta — confira tudo antes de salvar.');
-  }).catch(function () {
-    fallback('Sem conexão com a ponte. Usando a leitura do aparelho.');
+  }).catch(function (err) {
+    var code = err && err.code;
+    if (code === 'sem_chave') {
+      fallback('A leitura por IA ainda não foi ativada na ponte. Usando a leitura do aparelho.');
+    } else if (code === 'unauthorized') {
+      fallback('❌ A ponte recusou a chave (confira em Backup → Nuvem). Usando a leitura do aparelho.');
+    } else if (code === 'rede') {
+      fallback('Sem conexão com a ponte. Usando a leitura do aparelho.');
+    } else {
+      fallback('A leitura por IA não respondeu. Usando a leitura do aparelho.');
+    }
+  });
+}
+
+/* ============ Leitura com IA no cadastro (v1.19) ============
+   O mesmo "✨ Ler com IA", agora na tela de revisão/cadastro: com a
+   foto recém-capturada no formulário, a primeira leitura já pode ser
+   pela IA — sem salvar antes nem passar pelo histórico. A mescla
+   usa como base o que JÁ está no formulário (a leitura do aparelho
+   e/ou o que ele digitou): campo que a IA não leu mantém esse valor
+   (a mesma fidelidade de aiReadingToFormData). Nada salva sem ele
+   tocar em Salvar. Se a IA falhar, avisa curto e o formulário fica
+   EXATAMENTE como estava — aqui não cai pro "Reler foto", porque a
+   leitura do aparelho já feita continua valendo. */
+
+function formSnapshotForAi() {
+  var num = function (id) {
+    var n = parseInt(String($(id).value).replace(/[^0-9]/g, ''), 10);
+    return isNaN(n) ? 0 : n;
+  };
+  return {
+    type: formType,
+    date: $('fDate').value || todayISO(),
+    store: $('fStore').value,
+    amount: num('fAmount'),
+    tendered: num('fTendered'),
+    change: num('fChange'),
+    category: $('fCategory').value || 'Outros',
+    dueDate: $('fDue').value || null,
+    validUntil: $('fValid').value || null,
+    note: $('fNote').value
+  };
+}
+
+function aiReadPendingPhoto() {
+  if (!pendingPhoto) return;
+  var c = driveConfig();
+  if (!c.url || !c.key) {
+    toast('Pra ler com IA, configure a ponte da nuvem (tela Backup).');
+    return;
+  }
+  var btn = $('btnReadAINew');
+  var label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '✨ Lendo com IA… pode demorar'; }
+  var restore = function () { if (btn) { btn.disabled = false; btn.textContent = label; } };
+  var fail = function (msg) { restore(); toast(msg); };
+  callAiRead(pendingPhoto).then(function (leitura) {
+    var merged = aiReadingToFormData(leitura, formSnapshotForAi());
+    var photo = pendingPhoto, link = pendingLink, editId = editingId;
+    restore();
+    openReview(merged, photo, link, editId);
+    toast('Leitura por IA pronta — confira tudo antes de salvar.');
+  }).catch(function (err) {
+    var code = err && err.code;
+    if (code === 'sem_chave') fail('A leitura por IA ainda não foi ativada na ponte.');
+    else if (code === 'unauthorized') fail('❌ A ponte recusou a chave (confira em Backup → Nuvem).');
+    else if (code === 'rede') fail('Sem conexão com a ponte — os dados continuam como estão.');
+    else fail('A leitura por IA não respondeu — os dados continuam como estão.');
   });
 }
 
@@ -2213,6 +2299,12 @@ function openReview(data, photo, link, editId) {
   var ph = $('fPhoto');
   if (pendingPhoto) { ph.src = pendingPhoto; ph.classList.remove('hidden'); }
   else ph.classList.add('hidden');
+  /* v1.19: "Ler com IA" no cadastro — visível quando o formulário
+     tem foto (recém-capturada ou do item em edição). Com guarda,
+     como nos outros botões: HTML antigo em cache não quebra a
+     revisão, só não mostra o botão. */
+  var nb = $('btnReadAINew');
+  if (nb) nb.classList.toggle('hidden', !pendingPhoto);
   setFormType(data.type || 'recibo');
   $('fStore').value = data.store || '';
   $('fDate').value = data.date || todayISO();
@@ -3153,6 +3245,9 @@ function bindEvents() {
   /* v1.18 (mesma guarda). */
   var btnReadAIEl = $('btnReadAI');
   if (btnReadAIEl) btnReadAIEl.onclick = function () { aiReadCurrentPhoto(); };
+  /* v1.19 (mesma guarda). */
+  var btnReadAINewEl = $('btnReadAINew');
+  if (btnReadAINewEl) btnReadAINewEl.onclick = function () { aiReadPendingPhoto(); };
 
   $('btnExport').onclick = exportBackup;
   $('btnImport').onclick = function () { $('fileImport').click(); };
