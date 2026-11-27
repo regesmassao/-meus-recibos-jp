@@ -34,6 +34,12 @@ main{max-width:640px; margin:0 auto; padding:14px 12px}
 .grow{flex:1}
 .stack{display:flex; flex-direction:column; gap:10px}
 .grid2{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+.grid3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px}
+.grid3 input{min-width:0}
+/* v1.20: aviso da trava de duplicado na tela de revisão */
+.dup-warn{border:1px solid #b45309; background:#fdf3e0; border-radius:10px; padding:12px; margin-bottom:12px}
+.dup-warn-text{font-size:14px; font-weight:600; margin-bottom:10px}
+button:disabled{opacity:.45; cursor:not-allowed}
 button{
   font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink);
   border-radius:10px; padding:10px 14px; cursor:pointer;
@@ -55,6 +61,8 @@ label{display:block; font-size:13px; color:var(--muted); margin-bottom:5px}
 .total-card{background:var(--navy); color:var(--cream); border-color:var(--navy)}
 .total-label{font-size:13px; opacity:.8}
 .total-value{font-size:34px; font-weight:800; margin:4px 0}
+/* v1.20: desdobramento do total do mês (gastos × despesas) */
+.total-break{display:flex; justify-content:space-between; font-size:14px; padding:3px 0; opacity:.92}
 .total-card .muted{color:rgba(247,243,234,.75)}
 .catbar{margin-bottom:10px}
 .catbar-top{display:flex; justify-content:space-between; font-size:14px; margin-bottom:4px}
