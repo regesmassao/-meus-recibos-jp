@@ -123,6 +123,10 @@ label{display:block; font-size:13px; color:var(--muted); margin-bottom:5px}
   padding:10px 14px; margin-bottom:14px; font-size:13.5px;
 }
 .notice button.ghost{color:var(--navy); font-weight:600; white-space:nowrap; padding:6px 8px}
+/* Aviso de falha ao salvar no aparelho (v1.21): mais chamativo
+   que o aviso comum — dado não salvo não pode passar batido. */
+.save-warn{background:#fdf3e0; border-color:#b45309; font-weight:600}
+.save-warn button.ghost{color:#b45309}
 /* Painel (v1.4): KPIs e gráficos tocáveis */
 .kpis{display:flex; gap:10px; margin-top:10px}
 .kpi{flex:1; background:rgba(247,243,234,.12); border-radius:10px; padding:8px 6px; text-align:center}

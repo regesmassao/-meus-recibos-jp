@@ -1,5 +1,6 @@
-/* Meus Recibos JP — v1.9
-   Tudo fica no aparelho (localStorage, prefixo rec-). Nada é enviado a terceiros.
+/* Meus Recibos JP — v1.21
+   Tudo fica no aparelho (IndexedDB; até a v1.20 era localStorage,
+   prefixo rec-). Nada é enviado a terceiros.
    A leitura de fotos (OCR) roda no aparelho com Tesseract.js (jpn).
    v1.3: extração reforçada (nome fantasia, total/valor pago/troco) e
    salvamento automático após a leitura — editar virou opcional.
@@ -149,8 +150,28 @@
    Somados."): o cartão de categorias mostra os gastos por
    categoria + as despesas como grupo(s) somado(s) — nada de
    lista de itens na tela inicial; item individual é no
-   Histórico, como sempre. */
-var APP_VERSION = '1.20';
+   Histórico, como sempre.
+   v1.21 (2026-11-28): a base de armazenamento sai do localStorage
+   e vai pro IndexedDB. Diagnóstico dele: "toda hora que abro o
+   app tem que ficar importando e juntando; ele não tá segurando
+   — ao fechar volta pro 5.120". O backup tinha 3,09 MB (3,05 MB
+   de fotos em base64) e o localStorage do iOS (~5 MB, com custo
+   dobrado em UTF-16) estourava: a gravação nova falhava e, ao
+   reabrir, voltava o último estado que coube (o de 21/11, ¥5.120).
+   Agora os itens vivem no IndexedDB (banco recibos-jp-db), que
+   tem cota muito maior e é o lugar certo pra app de fotos. Na
+   primeira abertura, a v1.21 migra o que está no localStorage:
+   grava no IndexedDB, relê e confere (contagem de itens, soma dos
+   valores e tamanho das fotos) — só com a conferência batendo é
+   que a chave antiga é apagada; se não bater, nada é apagado e o
+   app segue no localStorage como antes (fallback honesto).
+   Gravação que falha NÃO é mais silenciosa: aparece o aviso fixo
+   "Não foi possível salvar no aparelho" com botão "Tentar de
+   novo". E foto nova entra mais leve: até 1280px, JPEG a partir
+   de 0,72, reencodando até mirar ≤ ~180 KB (fotos antigas não são
+   tocadas nem reencodadas). Envelope da nuvem, merge por id,
+   trava de duplicados, totais e distribuição: intocados. */
+var APP_VERSION = '1.21';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -1666,18 +1687,228 @@ function readPhotoAt(file, cb) {
   }, function () { finish(null); });
 }
 
-/* ============ Armazenamento ============ */
-function loadItems() {
+/* ============ Armazenamento ============
+   v1.21: os itens vivem no IndexedDB (banco 'recibos-jp-db',
+   store 'kv', chave 'items') — cota muito maior que a do
+   localStorage e o lugar certo pra guardar fotos. As chaves
+   pequenas de configuração (link/chave da ponte) continuam no
+   localStorage. bootStorage() decide a fonte na abertura:
+   1. Se o IndexedDB já tem os itens, é ele quem manda.
+   2. Se não tem e existe 'rec-items' no localStorage, MIGRA:
+      grava no IndexedDB, relê e confere (contagem, soma dos
+      valores e tamanho das fotos); só com tudo batendo é que a
+      chave antiga é apagada e a migração é marcada.
+   3. Sem IndexedDB, ou com a migração não conferida, o app segue
+      no localStorage como até a v1.20 (fallback honesto — nada
+      é apagado sem conferência).
+   TODA gravação passa por saveItems: em série (saveChain) e,
+   se falhar, o aviso fixo #saveWarn aparece — nunca mais a
+   falha silenciosa que fazia o app "não segurar" os dados. */
+var IDB_NAME = 'recibos-jp-db';
+var IDB_STORE = 'kv';
+var IDB_ITEMS_KEY = 'items';
+var LS_MIGRATED_KEY = 'rec-idb-migrated';
+var storageMode = 'idb'; /* 'idb' | 'ls' — decidido no bootStorage */
+var storageBootPromise = null;
+var idbDbPromise = null;
+var saveChain = Promise.resolve();
+var saveFailed = false;
+
+function idbFactory() {
+  try {
+    if (typeof window !== 'undefined' && window.indexedDB) return window.indexedDB;
+    if (typeof indexedDB !== 'undefined') return indexedDB;
+  } catch (e) { /* ambiente sem IndexedDB */ }
+  return null;
+}
+function idbOpen() {
+  if (idbDbPromise) return idbDbPromise;
+  var factory = idbFactory();
+  if (!factory) { idbDbPromise = Promise.resolve(null); return idbDbPromise; }
+  idbDbPromise = new Promise(function (resolve) {
+    var req;
+    try { req = factory.open(IDB_NAME, 1); } catch (e) { resolve(null); return; }
+    req.onupgradeneeded = function () {
+      var db = req.result;
+      if (db && db.objectStoreNames && !db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = function () { resolve(req.result || null); };
+    req.onerror = function () { resolve(null); };
+    req.onblocked = function () { resolve(null); };
+  });
+  return idbDbPromise;
+}
+function idbGet(key) {
+  return idbOpen().then(function (db) {
+    if (!db) return null;
+    return new Promise(function (resolve) {
+      var out = null;
+      var tx;
+      try { tx = db.transaction(IDB_STORE, 'readonly'); }
+      catch (e) { resolve(null); return; }
+      var rq = tx.objectStore(IDB_STORE).get(key);
+      rq.onsuccess = function () { out = rq.result === undefined ? null : rq.result; };
+      rq.onerror = function () { out = null; };
+      tx.oncomplete = function () { resolve(out); };
+      tx.onerror = function () { resolve(null); };
+      tx.onabort = function () { resolve(null); };
+    });
+  });
+}
+function idbPut(key, value) {
+  return idbOpen().then(function (db) {
+    if (!db) throw new Error('IndexedDB indisponível');
+    return new Promise(function (resolve, reject) {
+      var tx;
+      try { tx = db.transaction(IDB_STORE, 'readwrite'); }
+      catch (e) { reject(e); return; }
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error || new Error('falha ao gravar no IndexedDB')); };
+      tx.onabort = function () { reject(tx.error || new Error('gravação interrompida')); };
+    });
+  });
+}
+
+/* Leitura/gravação no formato antigo (localStorage) — usada pelo
+   fallback e como fonte da migração. lsLoadItems devolve null
+   quando não há nada (ou está ilegível); lsSaveItems pode lançar
+   (cota cheia) e quem chama trata. */
+function lsLoadItems() {
   try {
     var raw = localStorage.getItem(LS_KEY);
-    if (!raw) return [];
+    if (!raw) return null;
     var arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr : [];
-  } catch (e) { return []; }
+    return Array.isArray(arr) ? arr : null;
+  } catch (e) { return null; }
 }
-function saveItems(items) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(items)); }
-  catch (e) { toast('Espaço cheio: exporte o backup e exclua fotos antigas.'); }
+function lsSaveItems(arr) {
+  localStorage.setItem(LS_KEY, JSON.stringify(arr));
+}
+
+/* Impressão digital simples pra conferência da migração: o que
+   foi gravado tem que reler idêntico nestas três medidas. */
+function itemsDigest(arr) {
+  var sum = 0, photoChars = 0;
+  (arr || []).forEach(function (it) {
+    if (!it) return;
+    sum += Math.max(0, parseInt(it.amount, 10) || 0);
+    if (typeof it.photo === 'string') photoChars += it.photo.length;
+  });
+  return { count: (arr || []).length, sum: sum, photoChars: photoChars };
+}
+
+function bootStorage() {
+  if (storageBootPromise) return storageBootPromise;
+  storageBootPromise = idbGet(IDB_ITEMS_KEY).then(function (fromIdb) {
+    if (Array.isArray(fromIdb)) {
+      storageMode = 'idb';
+      return fromIdb;
+    }
+    var fromLs = lsLoadItems();
+    if (!fromLs) {
+      /* Nada guardado em lugar nenhum: app novo. As gravações
+         futuras vão pro IndexedDB (ou pro localStorage, se o
+         aparelho não tiver IndexedDB). */
+      storageMode = idbFactory() ? 'idb' : 'ls';
+      return [];
+    }
+    if (!idbFactory()) { storageMode = 'ls'; return fromLs; }
+    /* Migração localStorage → IndexedDB, com conferência. */
+    var clean = fromLs.map(sanitizeItem).filter(Boolean);
+    var before = itemsDigest(clean);
+    return idbPut(IDB_ITEMS_KEY, clean).then(function () {
+      return idbGet(IDB_ITEMS_KEY);
+    }).then(function (back) {
+      var after = itemsDigest(Array.isArray(back) ? back : []);
+      var ok = Array.isArray(back) && after.count === before.count &&
+        after.sum === before.sum && after.photoChars === before.photoChars;
+      if (!ok) { storageMode = 'ls'; return fromLs; } /* nada apagado */
+      try { localStorage.removeItem(LS_KEY); } catch (e) {}
+      try { localStorage.setItem(LS_MIGRATED_KEY, '1'); } catch (e) {}
+      storageMode = 'idb';
+      return clean;
+    }, function () {
+      storageMode = 'ls'; /* gravação falhou: nada apagado */
+      return fromLs;
+    });
+  });
+  return storageBootPromise;
+}
+
+/* Único caminho de gravação dos itens. No IndexedDB as
+   escritas são serializadas (saveChain) e a promessa devolvida
+   nunca rejeita — falha vira saveFailed + aviso visível
+   (#saveWarn), com o botão "Tentar de novo" regravando o estado
+   atual. No fallback localStorage a gravação é síncrona, como
+   até a v1.20, com a mesma regra: falhou, avisou. */
+function saveItems(arr) {
+  var target = arr || items;
+  if (storageMode !== 'idb') {
+    try {
+      lsSaveItems(target);
+      if (saveFailed) { saveFailed = false; hideSaveWarn(); }
+    } catch (e) {
+      saveFailed = true;
+      showSaveWarn();
+    }
+    return saveChain;
+  }
+  function write() { return idbPut(IDB_ITEMS_KEY, target); }
+  var run = saveChain.then(write, write);
+  saveChain = run.then(function () {
+    if (saveFailed) { saveFailed = false; hideSaveWarn(); }
+  }, function () {
+    saveFailed = true;
+    showSaveWarn();
+  });
+  return saveChain;
+}
+
+/* Aviso fixo de falha de gravação (v1.21). O elemento existe no
+   HTML; com HTML antigo em cache, ele é criado aqui — mesmo
+   padrão do rodapé de versão. */
+function saveWarnEl() {
+  if (typeof document === 'undefined' || !document.getElementById) return null;
+  var el = document.getElementById('saveWarn');
+  if (el) return el;
+  if (!document.createElement || !document.querySelector) return null;
+  var main = document.querySelector('main');
+  if (!main) return null;
+  el = document.createElement('div');
+  el.id = 'saveWarn';
+  el.className = 'notice save-warn hidden';
+  var span = document.createElement('span');
+  span.textContent = '⚠️ Não foi possível salvar no aparelho — toque em "Tentar de novo".';
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ghost';
+  btn.id = 'saveWarnRetry';
+  btn.textContent = 'Tentar de novo';
+  el.appendChild(span);
+  el.appendChild(btn);
+  main.insertBefore(el, main.firstChild);
+  bindSaveWarn(el);
+  return el;
+}
+function bindSaveWarn(box) {
+  var el = box || saveWarnEl();
+  if (!el || el.__saveWarnBound || !el.querySelector) return;
+  var btn = el.querySelector('#saveWarnRetry');
+  if (!btn) return;
+  el.__saveWarnBound = true;
+  btn.onclick = function () { saveItems(items); };
+}
+function showSaveWarn() {
+  var el = saveWarnEl();
+  if (el) el.classList.remove('hidden');
+}
+function hideSaveWarn() {
+  if (typeof document === 'undefined' || !document.getElementById) return;
+  var el = document.getElementById('saveWarn');
+  if (el) el.classList.add('hidden');
 }
 function sanitizeItem(raw) {
   if (!raw || typeof raw !== 'object' || !raw.id) return null;
@@ -2702,26 +2933,57 @@ function saveExtractedItem(data, photo, link) {
 }
 
 /* ============ Foto + OCR ============ */
+/* v1.21: a foto GUARDADA tem teto — até 1280px no maior lado e
+   mirando ≤ ~180 KB de JPEG. Se a primeira codificação (0,72)
+   passar do alvo, a qualidade cai em degraus e, por último, o
+   tamanho encolhe, até caber. A leitura (OCR/IA) não perde nada:
+   o OCR usa a cópia grande separada, feita do arquivo original
+   (makeOcrSource), e 1280px segue legível pra IA. Fotos já
+   guardadas NÃO passam por aqui — nunca são reencodadas. */
+var PHOTO_MAX_DIM = 1280;
+var PHOTO_TARGET_BYTES = 180 * 1024;
+function dataUrlBytes(u) {
+  if (!u) return 0;
+  var i = u.indexOf(',');
+  var b64 = i >= 0 ? u.slice(i + 1) : u;
+  return Math.floor(b64.length * 3 / 4);
+}
+function encodeStoredPhoto(img, w, h) {
+  var canvas = document.createElement('canvas');
+  var cw = Math.max(1, w), ch = Math.max(1, h);
+  var quality = 0.72;
+  var url = '';
+  for (var attempt = 0; attempt < 10; attempt++) {
+    canvas.width = cw; canvas.height = ch;
+    canvas.getContext('2d').drawImage(img, 0, 0, cw, ch);
+    url = canvas.toDataURL('image/jpeg', quality);
+    if (dataUrlBytes(url) <= PHOTO_TARGET_BYTES) break;
+    if (quality > 0.45) {
+      quality = Math.max(0.42, Math.round((quality - 0.14) * 100) / 100);
+    } else {
+      cw = Math.max(320, Math.round(cw * 0.82));
+      ch = Math.max(320, Math.round(ch * 0.82));
+      quality = 0.62;
+    }
+  }
+  return url;
+}
 function downscaleImage(file, cb) {
   var url = URL.createObjectURL(file);
   var img = new Image();
   img.onload = function () {
-    var max = 1200;
     var w = img.naturalWidth, h = img.naturalHeight;
-    var scale = Math.min(1, max / Math.max(w, h));
+    var scale = Math.min(1, PHOTO_MAX_DIM / Math.max(w, h));
     var cw = Math.round(w * scale), ch = Math.round(h * scale);
-    var canvas = document.createElement('canvas');
-    canvas.width = cw; canvas.height = ch;
-    canvas.getContext('2d').drawImage(img, 0, 0, cw, ch);
     URL.revokeObjectURL(url);
-    cb(canvas.toDataURL('image/jpeg', 0.7));
+    cb(encodeStoredPhoto(img, cw, ch));
   };
   img.onerror = function () { URL.revokeObjectURL(url); toast('Não consegui abrir essa imagem.'); };
   img.src = url;
 }
 
 /* v1.15: cópia SÓ pra leitura (OCR), bem maior que a foto guardada.
-   A foto salva continua em 1200px (limite do armazenamento local),
+   A foto salva é a versão leve (v1.21: até 1280px, ≤ ~180 KB),
    mas recibo comprido fotografado de longe — letra miúda, como o
    Ito-Yokado de 2026-11-23 — some na versão de 1200px; o OCR lê
    esta cópia de até 3000px feita do arquivo original. Devolve null
@@ -3578,6 +3840,8 @@ function bindEvents() {
   $('driveUp').onclick = driveUpload;
   $('driveDown').onclick = driveDownload;
   $('driveNoticeClose').onclick = driveHideNotice;
+  /* v1.21 (com guarda: HTML antigo em cache pode não ter o aviso). */
+  bindSaveWarn();
 }
 
 /* Rodapé de versão (v1.8): "Meus Recibos JP · versão X.Y" no fim
@@ -3609,13 +3873,8 @@ function renderVersionFooter(doc) {
   return text;
 }
 
+var bootPromise = null;
 function init() {
-  var rawItems = loadItems();
-  var needsMigration = rawItems.some(function (r) {
-    return r && typeof r === 'object' && (r.place === undefined || r.photoAt === undefined);
-  });
-  items = rawItems.map(sanitizeItem).filter(Boolean);
-  if (needsMigration) saveItems(items); // grava place/branch/phone/photoAt derivados
   var now = new Date();
   viewMonth = { y: now.getFullYear(), m: now.getMonth() };
   fillSelects();
@@ -3624,17 +3883,31 @@ function init() {
   $('driveUrl').value = localStorage.getItem('rec-driveUrl') || '';
   $('driveKey').value = localStorage.getItem('rec-driveKey') || '';
   driveRenderSync();
-  renderHome();
-  showView('home');
-  driveCheckOnOpen();
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(function () {});
   }
+  /* v1.21: a leitura dos itens é assíncrona (IndexedDB, com a
+     migração do localStorage quando é o caso); a tela inicial
+     renderiza quando os dados chegam. */
+  return bootStorage().then(function (rawItems) {
+    var needsMigration = rawItems.some(function (r) {
+      return r && typeof r === 'object' && (r.place === undefined || r.photoAt === undefined);
+    });
+    items = rawItems.map(sanitizeItem).filter(Boolean);
+    if (needsMigration) saveItems(items); // grava place/branch/phone/photoAt derivados
+    renderHome();
+    showView('home');
+    driveCheckOnOpen();
+    return items;
+  });
 }
 
 if (typeof document !== 'undefined' && document.getElementById) {
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-  else init();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { bootPromise = init(); });
+  } else {
+    bootPromise = init();
+  }
 }
 
 /* Exporta as funções puras para testes em Node (ignorado no navegador). */
@@ -3657,6 +3930,12 @@ if (typeof module !== 'undefined' && module.exports) {
     aiReadingToFormData: aiReadingToFormData,
     extractReceiptTime: extractReceiptTime,
     normalizeStoreKey: normalizeStoreKey,
-    findDuplicateReceipt: findDuplicateReceipt
+    findDuplicateReceipt: findDuplicateReceipt,
+    bootStorage: bootStorage, saveItems: saveItems,
+    lsLoadItems: lsLoadItems, itemsDigest: itemsDigest,
+    dataUrlBytes: dataUrlBytes, encodeStoredPhoto: encodeStoredPhoto,
+    getStorageMode: function () { return storageMode; },
+    getSaveFailed: function () { return saveFailed; },
+    flushSaves: function () { return saveChain; }
   };
 }
