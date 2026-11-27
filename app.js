@@ -144,7 +144,12 @@
    despesas. Não somente os gastos." — o total do mês na tela
    inicial passa a ser gastos (recibos) + despesas (contas pelo
    vencimento, mesma regra da Central), com o desdobramento em
-   linhas visíveis no cartão principal. */
+   linhas visíveis no cartão principal. E a distribuição do mês
+   fica completa e SOMADA (correção dele: "Mas não em linha.
+   Somados."): o cartão de categorias mostra os gastos por
+   categoria + as despesas como grupo(s) somado(s) — nada de
+   lista de itens na tela inicial; item individual é no
+   Histórico, como sempre. */
 var APP_VERSION = '1.20';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
@@ -1904,18 +1909,46 @@ function renderHome() {
   $('kpiAvg').textContent = monthReceipts.length
     ? fmtYen(Math.round(gastos / monthReceipts.length)) : '¥0';
 
-  /* --- Gráfico 1: gasto por categoria (toca → histórico filtrado) --- */
+
+
+  /* --- Gráfico 1: distribuição do mês, SOMADA (toca numa
+     categoria de gasto → histórico filtrado) ---
+     v1.20 (adição 2, corrigida por ele: "Mas não em linha.
+     Somados."): NADA de lista de itens na tela inicial — cada
+     grupo aparece com o seu TOTAL somado. Os gastos por categoria
+     (como sempre) + as DESPESAS como grupo(s) somado(s) no mesmo
+     cartão: conta com categoria própria agrupa nela; sem
+     categoria (ou 'Outros'), cai no grupo "Contas". As barras de
+     despesa têm cor própria e o marcador 📄. Gastos + despesas
+     aqui fecham com o total desdobrado do cartão principal. O
+     Histórico continua sendo o lugar dos itens individuais. */
   var byCat = {};
   monthReceipts.forEach(function (it) { byCat[it.category] = (byCat[it.category] || 0) + it.amount; });
   var cats = Object.keys(byCat).sort(function (a, b) { return byCat[b] - byCat[a]; });
-  var maxCat = cats.length ? byCat[cats[0]] : 0;
-  $('catBars').innerHTML = cats.length ? cats.map(function (c) {
+  var byBill = {};
+  monthBills.forEach(function (it) {
+    var g = (it.category && it.category !== 'Outros') ? it.category : 'Contas';
+    byBill[g] = (byBill[g] || 0) + it.amount;
+  });
+  var billGroups = Object.keys(byBill).sort(function (a, b) { return byBill[b] - byBill[a]; });
+  var maxCat = Math.max(cats.length ? byCat[cats[0]] : 0, billGroups.length ? byBill[billGroups[0]] : 0);
+  var gasBars = cats.map(function (c) {
     var pct = maxCat > 0 ? Math.round(byCat[c] / maxCat * 100) : 0;
     return '<button type="button" class="barbtn" data-cat="' + esc(c) + '">' +
       '<div class="catbar-top"><span>' + esc(c) + '</span>' +
       '<strong>' + fmtYen(byCat[c]) + '</strong></div>' +
       '<div class="catbar-track"><div class="catbar-fill" style="width:' + pct + '%"></div></div></button>';
-  }).join('') : '<div class="empty">Sem gastos registrados neste mês.</div>';
+  }).join('');
+  var billBars = billGroups.map(function (g) {
+    var pct = maxCat > 0 ? Math.round(byBill[g] / maxCat * 100) : 0;
+    return '<div class="barbtn bill-bar">' +
+      '<div class="catbar-top"><span>📄 ' + esc(g) + '</span>' +
+      '<strong>' + fmtYen(byBill[g]) + '</strong></div>' +
+      '<div class="catbar-track"><div class="catbar-fill bill-fill" style="width:' + pct + '%"></div></div></div>';
+  }).join('');
+  $('catBars').innerHTML = (gasBars || billBars)
+    ? gasBars + billBars
+    : '<div class="empty">Sem lançamentos registrados neste mês.</div>';
 
   /* --- Gráfico 2: top lugares do mês (toca → detalhe do lugar) --- */
   var topPlaces = monthPlaces.slice().sort(function (a, b) { return b.total - a.total; }).slice(0, 5);
