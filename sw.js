@@ -1,5 +1,5 @@
 /* Meus Recibos JP — service worker: network-first, offline fallback */
-const CACHE = 'recibos-jp-v1-20';
+const CACHE = 'recibos-jp-v1-21';
 const SHELL = [
   './',
   './index.html',
