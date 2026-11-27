@@ -31,8 +31,9 @@
     </div>
 
     <div class="card total-card">
-      <div class="total-label">Gasto do mês (recibos)</div>
+      <div class="total-label">Total do mês</div>
       <div id="monthTotal" class="total-value">¥0</div>
+      <div id="monthBreakdown" class="hidden"></div>
       <div class="kpis">
         <div class="kpi"><div class="kpi-value" id="kpiReceipts">0</div><div class="kpi-label">recibos</div></div>
         <div class="kpi"><div class="kpi-value" id="kpiPlaces">0</div><div class="kpi-label">lugares</div></div>
@@ -115,11 +116,15 @@
           <input id="fDate" type="date">
         </div>
         <div class="field">
+          <label for="fTime">Hora (impressa no recibo)</label>
+          <input id="fTime" type="time">
+        </div>
+      </div>
+      <div class="grid3">
+        <div class="field">
           <label for="fAmount">Valor (¥)</label>
           <input id="fAmount" type="number" inputmode="numeric" min="0" step="1" placeholder="0">
         </div>
-      </div>
-      <div class="grid2">
         <div class="field">
           <label for="fTendered">Valor pago (¥)</label>
           <input id="fTendered" type="number" inputmode="numeric" min="0" step="1" placeholder="お預かり">
@@ -148,6 +153,10 @@
       <div id="fLinkBox" class="field hidden">
         <label>Link do QR Code</label>
         <div><a id="fLink" href="#" target="_blank" rel="noopener"></a></div>
+      </div>
+      <div id="dupWarn" class="dup-warn hidden">
+        <div id="dupWarnText" class="dup-warn-text"></div>
+        <button id="btnDupOverride" class="big" type="button">Não é o mesmo recibo — salvar mesmo assim</button>
       </div>
       <div class="row gap">
         <button id="btnCancelReview" class="big" type="button">Cancelar</button>

@@ -124,8 +124,28 @@
    comportamento: no cadastro, se a IA falhar, o formulário fica
    EXATAMENTE como estava (a leitura do aparelho já feita continua
    valendo) — não cai pro "Reler foto". O botão do detalhe continua
-   como estava, com o fallback de sempre. */
-var APP_VERSION = '1.19';
+   como estava, com o fallback de sempre.
+   v1.20: TRAVA DE DUPLICADO (ideia dele, 2026-11-28) — o mesmo
+   recibo lido duas vezes não entra duas vezes. A leitura passa a
+   capturar a HORA IMPRESSA no recibo (a hora da compra no papel,
+   lida pelo OCR ou pela IA — nunca photoAt nem createdAt, que são
+   horários do app) no campo `time` do item. A chave de duplicidade
+   é data + valor + loja normalizada, e a hora desempata quando os
+   DOIS lados têm hora (compra repetida de verdade, mesma loja/dia/
+   valor em hora diferente, NÃO trava). A trava atua: (a) no fim da
+   leitura por foto — duplicado não salva sozinho: abre a revisão
+   com o aviso e o Salvar travado; (b) no botão Salvar (inclusive
+   lançamento manual); (c) nas releituras do detalhe, sem nunca
+   acusar o próprio item. Quem decide é ele: o aviso tem a saída
+   "Não é o mesmo recibo — salvar mesmo assim". A ponte atual não
+   devolve hora na leitura por IA — pra ela vale a chave de 3
+   campos, até a ponte um dia devolver `hora`.
+   v1.20 (adição, pedido dele na mesma noite): "Tem que somar as
+   despesas. Não somente os gastos." — o total do mês na tela
+   inicial passa a ser gastos (recibos) + despesas (contas pelo
+   vencimento, mesma regra da Central), com o desdobramento em
+   linhas visíveis no cartão principal. */
+var APP_VERSION = '1.20';
 var LS_KEY = 'rec-items';
 var CATEGORIES = ['Supermercado', 'Konbini', 'Restaurante', 'Transporte', 'Moradia',
   'Contas da casa', 'Saúde', 'Farmácia', 'Compras', 'Lazer', 'Lavanderia', 'Outros'];
@@ -1436,6 +1456,7 @@ function extractFromText(rawText) {
   return {
     type: type,
     date: dates.length ? dates[0] : todayISO(),
+    time: extractReceiptTime(text),
     store: info.store,
     place: info.place,
     branch: info.branch,
@@ -1447,6 +1468,84 @@ function extractFromText(rawText) {
     dueDate: due,
     validUntil: valid
   };
+}
+
+/* ============ Hora impressa no recibo + trava de duplicado (v1.20) ============
+   A hora que vale é a IMPRESSA NO PAPEL (a hora da compra, lida pelo
+   OCR ou pela IA) — nunca photoAt (quando a foto foi tirada) nem
+   createdAt (quando o item foi salvo): fotografar o mesmo recibo
+   dias depois muda os horários do app, mas a hora impressa é a
+   mesma, e é ela que identifica o recibo. Se a leitura não trouxer
+   a hora impressa, o campo fica vazio e a chave de duplicidade
+   trabalha sem ela. NUNCA inventar hora. */
+
+/* Extrai a hora impressa (HH:MM) do texto lido. Conservadora:
+   1º a hora na MESMA linha da data (o formato dos recibos térmicos:
+   "2026年11月20日 14:32", "2026/11/20(木) 14:32"); 2º a hora em
+   estilo japonês "14時32分" em qualquer linha; 3º a hora na linha
+   logo abaixo da data. Hora válida: 0–23h, 0–59min. Sem hora
+   legível com segurança → null. Função pura, testável. */
+function extractReceiptTime(rawText) {
+  var text = normalizeOcr(rawText);
+  function valid(h, m) { return h >= 0 && h <= 23 && m >= 0 && m <= 59; }
+  function colonTime(s) {
+    var m = /(\d{1,2}):(\d{2})(?::\d{2})?\b/.exec(s);
+    if (!m) return null;
+    return valid(+m[1], +m[2]) ? pad2(+m[1]) + ':' + pad2(+m[2]) : null;
+  }
+  function jpTime(s) {
+    var m = /(\d{1,2})時(\d{1,2})分/.exec(s);
+    if (!m) return null;
+    return valid(+m[1], +m[2]) ? pad2(+m[1]) + ':' + pad2(+m[2]) : null;
+  }
+  var dateRe = /(\d{4}\s*年|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}|令和)/;
+  var lines = text.split(/\n/);
+  var i, t;
+  for (i = 0; i < lines.length; i++) {
+    if (!dateRe.test(lines[i])) continue;
+    t = colonTime(lines[i]) || jpTime(lines[i]);
+    if (t) return t;
+  }
+  t = jpTime(text);
+  if (t) return t;
+  for (i = 0; i + 1 < lines.length; i++) {
+    if (!dateRe.test(lines[i])) continue;
+    t = colonTime(lines[i + 1]);
+    if (t) return t;
+  }
+  return null;
+}
+
+/* Nome da loja pra COMPARAÇÃO: caixa insensível, espaços (inclusive
+   os de largura cheia que o OCR enfia) colapsados, pontas aparadas. */
+function normalizeStoreKey(s) {
+  return String(s == null ? '' : s).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/* Chave de duplicidade: data + valor + loja normalizada — e a hora
+   impressa desempata QUANDO OS DOIS LADOS TÊM HORA (horas diferentes
+   = compras diferentes, não trava; um lado sem hora = a chave de 3
+   campos decide). Sem data, sem valor (> 0) ou sem loja, não há
+   chave confiável: devolve null (nada de travar lançamento vazio).
+   `excludeId` tira o próprio item da comparação (releitura/edição
+   nunca se autoacusa). Devolve o item existente que casou, ou null.
+   Função pura, testável. */
+function findDuplicateReceipt(list, cand, excludeId) {
+  if (!cand || !cand.date || !(Number(cand.amount) > 0)) return null;
+  var cs = normalizeStoreKey(cand.store);
+  if (!cs) return null;
+  var ct = typeof cand.time === 'string' ? cand.time : '';
+  for (var i = 0; i < (list || []).length; i++) {
+    var it = list[i];
+    if (!it || (excludeId && it.id === excludeId)) continue;
+    if (it.date !== cand.date) continue;
+    if ((Number(it.amount) || 0) !== (Number(cand.amount) || 0)) continue;
+    if (normalizeStoreKey(it.store) !== cs) continue;
+    var tt = typeof it.time === 'string' ? it.time : '';
+    if (ct && tt && ct !== tt) continue;
+    return it;
+  }
+  return null;
 }
 
 /* ============ Data da foto (photoAt) ============
@@ -1589,6 +1688,11 @@ function sanitizeItem(raw) {
     id: String(raw.id),
     type: type,
     date: typeof raw.date === 'string' ? raw.date : todayISO(),
+    /* v1.20: hora IMPRESSA no recibo ('HH:MM'), lida pelo OCR/IA.
+       Item antigo ou leitura sem hora fica '' — nunca photoAt nem
+       createdAt (horários do app não identificam o recibo). */
+    time: (typeof raw.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(raw.time))
+      ? raw.time : '',
     store: store,
     place: place,
     branch: normalizePlaceName(raw.branch || ''),
@@ -1708,6 +1812,15 @@ var editingId = null;
 var pendingPhoto = null;
 var pendingPhotoAt = null; // data da foto do arquivo em leitura (EXIF)
 var pendingLink = '';
+/* v1.20: leitura que a trava de duplicado desviou pra revisão (foto
+   → OCR → casou com item existente): guarda photoAt/ocrText/telefone/
+   lugar da leitura original pra, se ele salvar mesmo assim, o item
+   nascer completo. Qualquer outra abertura de revisão zera isto. */
+var pendingExtracted = null;
+/* v1.20: liberação da trava de duplicado ("Não é o mesmo recibo —
+   salvar mesmo assim"). Vale só pro formulário aberto; qualquer
+   edição nos campos-chave ou nova abertura de revisão zera isto. */
+var dupOverride = false;
 var currentDetailId = null;
 var placesYear = 'todos'; // filtro da aba Lugares
 var currentPlace = ''; // lugar aberto no detalhe de lugar
@@ -1755,15 +1868,41 @@ function renderHome() {
   var monthReceipts = items.filter(function (it) {
     return it.type === 'recibo' && monthKeyOf(it.date) === key;
   });
-  var total = monthReceipts.reduce(function (s, it) { return s + it.amount; }, 0);
+  var gastos = monthReceipts.reduce(function (s, it) { return s + it.amount; }, 0);
+  /* v1.20 (pedido dele, 2026-11-28): "Tem que somar as despesas.
+     Não somente os gastos." Despesas do mês = CONTAS pelo
+     VENCIMENTO (dueDate; sem vencimento, a data do lançamento),
+     pagas ou não — a mesma regra que a Salro Central usa pro
+     "saiu" do mês. O total principal vira gastos + despesas, com o
+     desdobramento VISÍVEL no cartão (nada de trocar o número em
+     silêncio). Mês sem contas: sem desdobramento, total = gastos,
+     como era antes. Categoria e ticket médio continuam só de
+     recibos — categoria é coisa de gasto. */
+  var monthBills = items.filter(function (it) {
+    return it.type === 'conta' && monthKeyOf(it.dueDate || it.date) === key;
+  });
+  var despesas = monthBills.reduce(function (s, it) { return s + it.amount; }, 0);
+  var total = gastos + despesas;
 
   /* --- KPIs do mês --- */
   $('monthTotal').textContent = fmtYen(total);
+  var mbEl = $('monthBreakdown');
+  if (mbEl) {
+    if (monthBills.length) {
+      mbEl.innerHTML =
+        '<div class="total-break"><span>Gastos (recibos)</span><strong>' + fmtYen(gastos) + '</strong></div>' +
+        '<div class="total-break"><span>Despesas (contas)</span><strong>' + fmtYen(despesas) + '</strong></div>';
+      mbEl.classList.remove('hidden');
+    } else {
+      mbEl.innerHTML = '';
+      mbEl.classList.add('hidden');
+    }
+  }
   $('kpiReceipts').textContent = String(monthReceipts.length);
   var monthPlaces = groupPlaces(monthReceipts, 'todos');
   $('kpiPlaces').textContent = String(monthPlaces.length);
   $('kpiAvg').textContent = monthReceipts.length
-    ? fmtYen(Math.round(total / monthReceipts.length)) : '¥0';
+    ? fmtYen(Math.round(gastos / monthReceipts.length)) : '¥0';
 
   /* --- Gráfico 1: gasto por categoria (toca → histórico filtrado) --- */
   var byCat = {};
@@ -2018,6 +2157,8 @@ function renderDetail(id) {
     ['Data do recibo', fmtDateBR(it.date)],
     ['Valor', it.amount > 0 ? fmtYen(it.amount) : '—']
   ];
+  /* v1.20: a hora impressa no recibo, quando a leitura achou. */
+  if (it.time) rows.splice(2, 0, ['Hora do recibo', it.time]);
   if (it.photoAt) rows.push(['Foto', fmtDateBR(it.photoAt)]);
   if (it.tendered > 0) rows.push(['Valor pago', fmtYen(it.tendered)]);
   if (it.change > 0) rows.push(['Troco', fmtYen(it.change)]);
@@ -2083,7 +2224,29 @@ function rereadCurrentPhoto() {
   prepareAndOcr(it.photo).then(function (text) {
     var data = extractFromText(text || '');
     var datesFound = findAllDates(normalizeOcr(text || ''));
+    /* v1.20: a trava vale na releitura também — se o resultado
+       casar com OUTRO item do histórico, a foto deste item é, na
+       prática, o recibo do outro: NÃO aplica nada e avisa. O
+       próprio item fica fora da comparação (reler o próprio recibo
+       nunca se autoacusa). Pra corrigir na mão, o caminho é o
+       Editar, onde a trava tem a saída "salvar mesmo assim". */
+    var cand = {
+      date: datesFound.length ? data.date : it.date,
+      store: data.store || it.store,
+      amount: (data.amount != null && data.amount >= 100) ? data.amount : it.amount,
+      time: data.time || it.time || ''
+    };
+    var dup = findDuplicateReceipt(items, cand, it.id);
+    if (dup) {
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+      toast('⚠️ Essa foto parece ser de um recibo já lançado: ' +
+        (dup.store || 'loja') + ' · ' + fmtDateBR(dup.date) +
+        (dup.time ? ' ' + dup.time : '') + ' · ' + fmtYen(dup.amount) +
+        '. Releitura não aplicada.');
+      return;
+    }
     if (data.store) { it.store = data.store; it.place = data.place; it.branch = data.branch; }
+    if (data.time) it.time = data.time;
     if (data.phone) it.phone = data.phone;
     if (datesFound.length) it.date = data.date;
     /* Total < ¥100 é fragmento, não total (mesmo critério da guarda
@@ -2129,6 +2292,16 @@ function aiNumOrNull_(v) {
   return (v !== null && v !== undefined && isFinite(n) && n >= 0) ? Math.round(n) : null;
 }
 
+/* Hora impressa vinda da IA ('HH:MM'), validada. A ponte atual NÃO
+   devolve hora — isto é só a porta de entrada, pro dia em que ela
+   passar a devolver `hora`; sem ela, vale null e a chave de
+   duplicidade trabalha com os 3 campos. */
+function aiTimeOrNull_(v) {
+  if (typeof v !== 'string') return null;
+  var m = /^([01]\d|2[0-3]):([0-5]\d)/.exec(v.trim());
+  return m ? m[1] + ':' + m[2] : null;
+}
+
 /* Junta a leitura da IA com o item atual, no formato que a tela de
    revisão entende. Campo que a IA não achou mantém o valor que o
    item já tinha — igual ao "Reler foto": só sobrescreve o que a
@@ -2143,6 +2316,7 @@ function aiReadingToFormData(leitura, it) {
   return {
     type: tipo || (it ? it.type : 'recibo'),
     date: aiValidDate_(l.data) || (it ? it.date : todayISO()),
+    time: aiTimeOrNull_(l.hora) || (it ? (it.time || '') : ''),
     store: loja || (it ? it.store : ''),
     amount: total !== null ? total : (it && it.amount > 0 ? it.amount : null),
     tendered: aiNumOrNull_(l.valor_pago) !== null ? aiNumOrNull_(l.valor_pago) : (it ? it.tendered : null),
@@ -2243,6 +2417,7 @@ function formSnapshotForAi() {
   return {
     type: formType,
     date: $('fDate').value || todayISO(),
+    time: formTimeValue(),
     store: $('fStore').value,
     amount: num('fAmount'),
     tendered: num('fTendered'),
@@ -2295,6 +2470,7 @@ function openReview(data, photo, link, editId) {
   editingId = editId || null;
   pendingPhoto = photo || null;
   pendingLink = link || '';
+  pendingExtracted = null; // quem desvia por duplicado religa isto depois
   $('reviewTitle').textContent = editId ? 'Editar item' : 'Confira antes de salvar';
   var ph = $('fPhoto');
   if (pendingPhoto) { ph.src = pendingPhoto; ph.classList.remove('hidden'); }
@@ -2308,6 +2484,10 @@ function openReview(data, photo, link, editId) {
   setFormType(data.type || 'recibo');
   $('fStore').value = data.store || '';
   $('fDate').value = data.date || todayISO();
+  /* v1.20: a hora impressa vai pro campo próprio do formulário
+     (com guarda: HTML antigo em cache não tem o campo). */
+  var ftEl = $('fTime');
+  if (ftEl) ftEl.value = (typeof data.time === 'string' && /^\d{2}:\d{2}$/.test(data.time)) ? data.time : '';
   $('fAmount').value = data.amount != null ? data.amount : '';
   $('fTendered').value = data.tendered ? data.tendered : '';
   $('fChange').value = data.change ? data.change : '';
@@ -2320,9 +2500,64 @@ function openReview(data, photo, link, editId) {
     var a = $('fLink');
     a.href = pendingLink; a.textContent = pendingLink;
   } else $('fLinkBox').classList.add('hidden');
+  /* v1.20: revisão aberta = conferência de duplicado refeita do
+     zero (a liberação "salvar mesmo assim" não vaza entre itens). */
+  dupOverride = false;
+  checkDuplicateForm();
   showView('review');
 }
+/* ============ Trava de duplicado no formulário (v1.20) ============ */
+function formTimeValue() {
+  var el = $('fTime');
+  return el ? (el.value || '') : '';
+}
+
+/* O candidato à chave de duplicidade, do que está NO formulário. */
+function formCandidate() {
+  var amount = parseInt(String($('fAmount').value).replace(/[^0-9]/g, ''), 10);
+  return {
+    date: $('fDate').value || '',
+    store: $('fStore').value || '',
+    amount: isNaN(amount) ? 0 : amount,
+    time: formTimeValue()
+  };
+}
+
+/* Confere o formulário contra o histórico (o próprio item em edição
+   fica de fora) e reflete o resultado: casou → aviso visível com os
+   dados do item que JÁ existe + Salvar travado; não casou → aviso
+   escondido + Salvar livre. A liberação (dupOverride) esconde o
+   aviso e destrava. Sem a caixa no HTML (cache antigo), não trava
+   nada — degrada em silêncio, como os outros botões com guarda. */
+function checkDuplicateForm() {
+  var box = $('dupWarn'), btn = $('btnSave');
+  if (!box || !btn) return null;
+  var match = dupOverride ? null : findDuplicateReceipt(items, formCandidate(), editingId);
+  if (match) {
+    var txt = $('dupWarnText');
+    if (txt) {
+      txt.textContent = '⚠️ Este recibo já está no histórico: ' +
+        (match.store || 'loja') + ' · ' + fmtDateBR(match.date) +
+        (match.time ? ' ' + match.time : '') + ' · ' + fmtYen(match.amount);
+    }
+    box.classList.remove('hidden');
+    btn.disabled = true;
+  } else {
+    box.classList.add('hidden');
+    btn.disabled = false;
+  }
+  return match;
+}
+
 function saveFromForm() {
+  /* v1.20: a trava vale também aqui dentro — nem um Salvar
+     disparado por fora do botão (ou com o botão reabilitado na mão)
+     salva um duplicado sem a liberação explícita dele. */
+  if (!dupOverride && findDuplicateReceipt(items, formCandidate(), editingId)) {
+    checkDuplicateForm();
+    toast('⚠️ Este recibo já está no histórico — confira o aviso antes de salvar.');
+    return;
+  }
   var amount = parseInt(String($('fAmount').value).replace(/[^0-9]/g, ''), 10);
   var tendered = parseInt(String($('fTendered').value).replace(/[^0-9]/g, ''), 10);
   var change = parseInt(String($('fChange').value).replace(/[^0-9]/g, ''), 10);
@@ -2330,6 +2565,7 @@ function saveFromForm() {
     id: editingId || newId(),
     type: formType,
     date: $('fDate').value || todayISO(),
+    time: formTimeValue(),
     store: $('fStore').value.trim(),
     place: '',
     branch: '',
@@ -2350,6 +2586,10 @@ function saveFromForm() {
     var old = items.find(function (x) { return x.id === editingId; });
     if (old) {
       data.paid = old.paid; data.createdAt = old.createdAt;
+      /* Edição sem hora no campo mantém a hora que o item já tinha
+         (o campo mostra a hora do item ao abrir; isto é só a rede
+         de segurança pra HTML antigo sem o campo fTime). */
+      if (!data.time) data.time = old.time || '';
       data.phone = old.phone || '';
       data.photoAt = old.photoAt || null; // foto não muda na edição
       data.ocrText = old.ocrText || ''; // leitura original não muda na edição
@@ -2367,11 +2607,22 @@ function saveFromForm() {
     toast('Item atualizado ✔');
   } else {
     data.place = normalizePlaceName(data.store);
+    /* v1.20: item que nasceu de uma leitura desviada pela trava
+       herda o que a leitura original tinha achado (data da foto,
+       texto do OCR, telefone, lugar/filial) — salvar mesmo assim
+       não pode perder o que a leitura leu. */
+    if (pendingExtracted) {
+      data.photoAt = pendingExtracted.photoAt || null;
+      data.ocrText = pendingExtracted.ocrText || '';
+      if (pendingExtracted.phone) data.phone = pendingExtracted.phone;
+      if (pendingExtracted.place) data.place = pendingExtracted.place;
+      data.branch = pendingExtracted.branch || '';
+    }
     items.push(sanitizeItem(data) || data);
     toast('Salvo ✔');
   }
   saveItems(items);
-  editingId = null; pendingPhoto = null; pendingLink = '';
+  editingId = null; pendingPhoto = null; pendingLink = ''; pendingExtracted = null;
   viewMonth = { y: +(data.date.slice(0, 4)), m: (+(data.date.slice(5, 7))) - 1 };
   renderHome();
   showView('home');
@@ -2387,6 +2638,7 @@ function saveExtractedItem(data, photo, link) {
     id: newId(),
     type: data.type || 'recibo',
     date: data.date || todayISO(),
+    time: data.time || '',
     store: data.store || '',
     place: data.place || '',
     branch: data.branch || '',
@@ -2784,6 +3036,22 @@ function prepareAndOcr(dataUrl) {
 
 /* dataUrl = foto GUARDADA (1200px); ocrDataUrl = cópia grande só
    pra leitura (v1.15) — o item salva sempre a guardada. */
+/* v1.20: fim de uma leitura por foto. Sem duplicado, salva sozinho
+   como sempre. COM duplicado, a trava não deixa o salvamento ser
+   silencioso: abre a tela de revisão com os dados da leitura, o
+   aviso de duplicado e o Salvar travado — ele confere e decide
+   (cancelar, ou "salvar mesmo assim" no aviso). */
+function saveOrReviewExtracted(data, photo) {
+  if (findDuplicateReceipt(items, data, null)) {
+    openReview(data, photo, '');
+    pendingExtracted = data; // openReview zera; a leitura é esta
+    checkDuplicateForm();
+    toast('⚠️ Parece que este recibo já foi lançado — confira antes de salvar.');
+    return null;
+  }
+  return saveExtractedItem(data, photo, '');
+}
+
 function runOCR(dataUrl, ocrDataUrl) {
   var ocrSrc = ocrDataUrl || dataUrl;
   var box = $('ocrBox');
@@ -2805,7 +3073,7 @@ function runOCR(dataUrl, ocrDataUrl) {
     if (data.amount != null && data.amount < 100) data.amount = null;
     data.photoAt = pendingPhotoAt;
     data.ocrText = text;
-    saveExtractedItem(data, dataUrl, '');
+    saveOrReviewExtracted(data, dataUrl);
   }).catch(function () {
     /* Plano B: leitura simples, como era antes da v1.5. */
     Tesseract.recognize(ocrSrc, 'jpn', {
@@ -2822,7 +3090,7 @@ function runOCR(dataUrl, ocrDataUrl) {
       if (data.amount != null && data.amount < 100) data.amount = null;
       data.photoAt = pendingPhotoAt;
       data.ocrText = text;
-      saveExtractedItem(data, dataUrl, '');
+      saveOrReviewExtracted(data, dataUrl);
     }).catch(function () {
       box.classList.add('hidden');
       saveExtractedItem({ type: 'recibo', date: todayISO(), category: 'Outros', photoAt: pendingPhotoAt }, dataUrl, '');
@@ -3166,8 +3434,27 @@ function bindEvents() {
     b.onclick = function () { setFormType(b.getAttribute('data-type')); };
   });
   $('btnSave').onclick = saveFromForm;
+  /* v1.20 (com guarda, como os outros botões novos): a saída da
+     trava de duplicado e a vigilância dos campos-chave do formulário
+     — qualquer mudança em loja/data/valor/hora refaz a conferência
+     e derruba uma liberação anterior. */
+  var btnDupOverrideEl = $('btnDupOverride');
+  if (btnDupOverrideEl) btnDupOverrideEl.onclick = function () {
+    dupOverride = true;
+    var box = $('dupWarn');
+    if (box) box.classList.add('hidden');
+    var btn = $('btnSave');
+    if (btn) btn.disabled = false;
+  };
+  ['fStore', 'fDate', 'fAmount', 'fTime'].forEach(function (fid) {
+    var el = $(fid);
+    if (!el) return;
+    var onDupField = function () { dupOverride = false; checkDuplicateForm(); };
+    el.addEventListener('input', onDupField);
+    el.addEventListener('change', onDupField);
+  });
   $('btnCancelReview').onclick = function () {
-    editingId = null; pendingPhoto = null; pendingLink = '';
+    editingId = null; pendingPhoto = null; pendingLink = ''; pendingExtracted = null;
     showView(editingId ? 'detail' : 'home');
     renderHome();
   };
@@ -3334,6 +3621,9 @@ if (typeof module !== 'undefined' && module.exports) {
     buildBackupPayload: buildBackupPayload,
     APP_VERSION: APP_VERSION, renderVersionFooter: renderVersionFooter,
     hasTotalsMarkers: hasTotalsMarkers,
-    aiReadingToFormData: aiReadingToFormData
+    aiReadingToFormData: aiReadingToFormData,
+    extractReceiptTime: extractReceiptTime,
+    normalizeStoreKey: normalizeStoreKey,
+    findDuplicateReceipt: findDuplicateReceipt
   };
 }
